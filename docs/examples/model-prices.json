@@ -1,0 +1,17 @@
+{
+  "_comment": "Copy to config/model-prices.json for bin/fm-cost-report.sh. Rates are US dollars per million tokens and these numbers are placeholders, not published prices; replace them with your provider's current rates. Model ids must match the transcripts exactly; a model left out makes its tasks report tokens without a dollar figure. Keys other than models are ignored.",
+  "models": {
+    "claude-opus-5": {
+      "fresh_input": 5.0,
+      "cache_write": 6.25,
+      "cache_read": 0.5,
+      "output": 25.0
+    },
+    "gpt-6-astra": {
+      "fresh_input": 1.25,
+      "cache_write": 1.25,
+      "cache_read": 0.125,
+      "output": 10.0
+    }
+  }
+}
