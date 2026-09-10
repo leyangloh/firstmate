@@ -116,6 +116,29 @@ render() {  # <home> <charted-json> [charted_more] [charted_warning_more]
   render_board "$1" '[]' "$2" "${3:-0}" "${4:-0}"
 }
 
+# Build a board whose one decision card carries <context-json> and return what
+# the renderer produced for it.
+render_card_context() {  # <home> <context-json>
+  local home=$1 context=$2 data="$1/payload.json"
+  jq -n --argjson context "$context" '{
+    schema:"fm-bearings-board.v1", home:"render-home", generated:"2026-08-26T00:00Z",
+    prs_live:false, underway:[], landed:[], charted:[], charted_more:0,
+    charted_warning_more:0,
+    captains_call:[{
+      key:"gb-closeout-exports-captain-calls", type:"decision", repo:"sample",
+      title:"Closeout captain calls", about:"Cited findings", decide:"Which way?",
+      options:[{value:"one",label:"Q1 go"},{value:"hold",label:"Hold"}],
+      context:$context}]}' > "$data"
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROCEVENT_CLAIM_ROOT="$home/procevent-claims" \
+    LAVISH_AXI_STATE_DIR="$home/lavish-state" \
+    "$BOARD" build "$data" >/dev/null || fail "the board did not build"
+  require_listener_reached_poll "$home"
+  node "$HARNESS" "$home/.lavish/bearings-board.html" \
+    || fail "the built board could not be rendered"
+}
+
 charted_next_count() {  # <render-json>
   printf '%s' "$1" | jq -r '.stats[] | select(.label == "charted next") | .n'
 }
@@ -266,10 +289,101 @@ test_charted_rows_without_a_filed_date_follow_the_dated_rows_in_payload_order() 
   pass "charted rows with no filed date follow the dated rows in payload order"
 }
 
+test_a_cited_finding_arrives_on_the_card_as_a_collapsed_disclosure() {
+  local home out
+  home=$(make_home card-context)
+  mkdir -p "$home/data/gb-risk-closeout-exports"
+  printf '# Report\n\nSection 4 body.\n' > "$home/data/gb-risk-closeout-exports/report.md"
+  # The excerpt keeps its literal markdown backticks; nothing here expands.
+  # shellcheck disable=SC2016
+  out=$(render_card_context "$home" '[
+    {"label":"R6 - closeout exports use a different supply pool",
+     "report":"data/gb-risk-closeout-exports/report.md","anchor":"section 4",
+     "markdown":"**Q1 (blocks R6).** Should the feedyard subsheet and the closeout agree?\n\n- one line in `SheetController`\n- it moves closeout money\n"},
+    {"label":"R7 - tracker money-gate asymmetry","markdown":"Which side of the gate is correct?"}
+  ]')
+  printf '%s' "$out" | jq -e '.error == ""' >/dev/null \
+    || fail "the board rendered its fail-closed error instead of the card: $out"
+  printf '%s' "$out" | jq -e '
+    (.call | length) == 1
+      and (.call[0].context.summary == "Context (2)")
+      and ((.call[0].context.entries | length) == 2)
+      and (.call[0].context.entries[0].label == "R6 - closeout exports use a different supply pool")
+      and (.call[0].context.entries[0].source | test("data/gb-risk-closeout-exports/report\\.md"))
+      and (.call[0].context.entries[0].source | test("section 4"))
+      and (.call[0].context.entries[1].source == "")
+  ' >/dev/null || fail "the cited findings did not reach the card: $out"
+
+  # The excerpt renders as markup, not as escaped source text.
+  printf '%s' "$out" | jq -e '
+    .call[0].context.entries[0].html as $h
+    | ($h | test("<strong>Q1 \\(blocks R6\\)\\.</strong>"))
+      and ($h | test("<code>SheetController</code>"))
+      and ($h | test("<li>it moves closeout money</li>"))
+  ' >/dev/null || fail "the excerpt did not render its markdown: $out"
+  pass "a cited finding arrives on the card as a collapsed Context disclosure"
+}
+
+test_a_card_without_context_renders_no_disclosure() {
+  local home out
+  home=$(make_home card-no-context)
+  out=$(render_card_context "$home" '[]')
+  printf '%s' "$out" | jq -e '(.call | length) == 1 and (.call[0].context == null)' >/dev/null \
+    || fail "an empty context still produced a disclosure: $out"
+  pass "a card citing nothing renders no Context disclosure"
+}
+
+test_report_prose_cannot_inject_markup_into_the_card() {
+  local home out
+  home=$(make_home card-context-escape)
+  out=$(render_card_context "$home" '[
+    {"label":"R2 - <img src=x onerror=alert(1)>",
+     "markdown":"A report can contain <script>alert(1)</script> and <b onclick=\"x\">markup</b>.\n\n> quoted \u0026 escaped\n"}
+  ]')
+  printf '%s' "$out" | jq -e '.error == ""' >/dev/null \
+    || fail "the escaping case broke the render: $out"
+  # The label rides textContent, so its angle brackets are never markup at all.
+  printf '%s' "$out" | jq -e '.call[0].context.entries[0].label == "R2 - <img src=x onerror=alert(1)>"' \
+    >/dev/null || fail "the label was not carried as text: $out"
+  # Every character of the excerpt is escaped before any markup is applied, so
+  # the only tags in the rendered HTML are the allowlist ones.
+  printf '%s' "$out" | jq -e '
+    .call[0].context.entries[0].html as $h
+    | ($h | test("&lt;script&gt;"))
+      and ($h | test("&lt;b onclick=&quot;x&quot;&gt;"))
+      and ($h | test("<script"; "i") | not)
+      and ($h | test("onerror") | not)
+      and ($h | test("<blockquote>quoted &amp; escaped</blockquote>"))
+  ' >/dev/null || fail "report prose reached the card as live markup: $out"
+  pass "report prose is escaped before markdown markup is applied"
+}
+
+test_a_staged_report_becomes_a_link_while_a_missing_one_stays_plain_text() {
+  local home out
+  home=$(make_home card-context-link)
+  mkdir -p "$home/data/present"
+  printf '# Present\n' > "$home/data/present/report.md"
+  out=$(render_card_context "$home" '[
+    {"label":"present","report":"data/present/report.md"},
+    {"label":"missing","report":"data/absent/report.md"}
+  ]')
+  printf '%s' "$out" | jq -e '
+    (.call[0].context.entries[0].href | test("^bearings-report-[0-9a-f]+\\.md$"))
+      and (.call[0].context.entries[0].source == "data/present/report.md")
+      and (.call[0].context.entries[1].href == "")
+      and (.call[0].context.entries[1].source == "data/absent/report.md")
+  ' >/dev/null || fail "the cited-report link did not follow what was served: $out"
+  pass "a served report links while a missing one keeps its authoritative path as text"
+}
+
 test_an_underway_row_leads_with_the_task_name_and_keeps_its_run_status
 test_an_underway_identifier_label_is_not_replaced_by_run_status
 test_charted_next_reads_newest_filed_first
 test_charted_rows_without_a_filed_date_follow_the_dated_rows_in_payload_order
+test_a_cited_finding_arrives_on_the_card_as_a_collapsed_disclosure
+test_a_card_without_context_renders_no_disclosure
+test_report_prose_cannot_inject_markup_into_the_card
+test_a_staged_report_becomes_a_link_while_a_missing_one_stays_plain_text
 test_a_warning_row_reads_as_a_repair_not_as_queued_work
 test_warnings_are_excluded_from_the_charted_next_count
 test_a_board_of_only_warnings_still_reports_nothing_queued

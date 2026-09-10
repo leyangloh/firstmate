@@ -54,6 +54,35 @@
 # hidden is worse than a card wrongly shown. Cleanup is therefore a normal
 # rebuild effect rather than a committed migration or direct state mutation.
 #
+# CARD CONTEXT. A Captain's Call card that cites a finding code or a report
+# section is not decidable from the code alone, so every card may carry an
+# optional `context` array whose entries put that evidence on the card itself:
+#
+#   "context": [{
+#     "label":    optional string, the human name of the cited finding
+#     "report":   optional repo-relative report path, e.g.
+#                 "data/gb-risk-closeout-exports/report.md"; must be relative,
+#                 must not escape the home with a `..` segment, and is limited
+#                 to [A-Za-z0-9._/-]
+#     "anchor":   optional string naming the section inside that report
+#     "markdown": optional excerpt, at most 8192 UTF-8 bytes
+#   }]
+#
+# At least one of `report` and `markdown` must be present per entry; an entry
+# carrying neither is refused, and so is an oversize excerpt - a bounded field
+# is refused rather than silently truncated, because a half-quoted finding
+# reads as the whole finding.
+#
+# A referenced report that exists under $FM_HOME is STAGED beside the board as
+# `.lavish/bearings-report-<digest>.md` and the entry gains a build-computed
+# `report_href` naming that copy, because Lavish serves files that sit in the
+# artifact's own directory (verified against lavish-axi 0.1.61: a sibling file
+# is served at `/artifact/<session>/<name>`, while the board page itself cannot
+# open a `file://` URL from its http origin). The staged copy is a build-time
+# snapshot; the card always displays the authoritative `report` path as the
+# link text, so the captain reads the real location even when the snapshot has
+# aged. A report path that does not exist stages nothing and stays plain text.
+#
 # THE RECONCILE CHOICE. Every decision card carries the standard `reconcile`
 # option, injected here so the guarantee does not depend on the composer's
 # memory, and the payload validator reserves that value across every card type.
@@ -134,6 +163,22 @@ validate_payload() {  # <data.json>
         | type == "string"
           and test("^https://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:[/?#][^[:space:]]*)?$"));
     def version: type == "string" and test("^(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})$");
+    def safe_report_path:
+      type == "string" and length > 0 and length <= 512
+      and (test("^/") | not)
+      and (test("(^|/)\\.\\.(/|$)") | not)
+      and test("^[A-Za-z0-9._/-]+$");
+    def context_entry:
+      type == "object"
+      and optional_string("label")
+      and optional_string("anchor")
+      and (has("report") or has("markdown"))
+      and ((has("report") | not) or (.report | safe_report_path))
+      and ((has("markdown") | not)
+        or ((.markdown | type == "string") and (.markdown | utf8bytelength) <= 8192));
+    def optional_context:
+      (has("context") | not)
+      or ((.context | type == "array") and ([.context[] | context_entry] | all));
     def optional_subject:
       (has("subject") | not)
       or (.subject
@@ -158,6 +203,7 @@ validate_payload() {  # <data.json>
       and (optional_string("decide"))
       and (optional_string("detail"))
       and (optional_https_url("pr_url"))
+      and optional_context
       and optional_subject
       and (if has("subject") then .type == "decision" else true end)
       and (optional_string("freeform_hint"))
@@ -337,6 +383,61 @@ effective_payload() {  # <data.json> <dest.json>
     ]' "$data" > "$dest" || return 1
 }
 
+# --- Card context reports -----------------------------------------------------
+# Lavish serves whatever sits in the artifact's own directory, so a report copy
+# placed beside the board is reachable from the board page while the original
+# under $FM_HOME is not, and the page cannot open a file:// URL from its http
+# origin. Staging is therefore what makes a cited report clickable at all.
+
+path_digest() {  # <string>
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{print substr($1,1,12)}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{print substr($1,1,12)}'
+  else
+    printf '%s' "$1" | cksum | awk '{printf "%08x", $1}'
+  fi
+}
+
+# Stage every cited report beside the board and record the served name on its
+# context entries. A path that resolves to no readable file inside this home
+# stages nothing and keeps the plain-text path the template already shows, so a
+# moved or unreadable report degrades to the same minimum rather than failing
+# the build over a presentation detail.
+stage_context_reports() {  # <payload.json> <board-dir>
+  local payload=$1 dir=$2 rel src real home_real digest dest map='{}' tmp
+  (umask 077; mkdir -p "$dir") || return 1
+  home_real=$(board_realpath "$FM_HOME") || return 1
+  # Retire the previous build's copies first, so a report no longer cited by
+  # any card stops being served instead of lingering as a stale snapshot.
+  rm -f -- "$dir"/bearings-report-*.md
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    src="$FM_HOME/$rel"
+    [ -f "$src" ] && [ ! -L "$src" ] || continue
+    real=$(board_realpath "$src") || continue
+    case "$real" in "$home_real"/*) ;; *) continue ;; esac
+    digest=$(path_digest "$rel") || return 1
+    dest="bearings-report-$digest.md"
+    cp -- "$real" "$dir/$dest" || return 1
+    chmod 0600 "$dir/$dest" || return 1
+    map=$(jq -c --arg rel "$rel" --arg href "$dest" '.[$rel] = $href' <<< "$map") || return 1
+  done < <(jq -r '[.captains_call[]?.context[]?.report // empty] | unique[]' "$payload")
+  tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-bearings-staged.XXXXXX") || return 1
+  if ! jq --argjson map "$map" '
+    .captains_call = [.captains_call[]
+      | if has("context")
+        then .context = [.context[]
+          | if (.report? != null) and ($map[.report] != null)
+            then .report_href = $map[.report] else . end]
+        else . end]
+  ' "$payload" > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  mv -f -- "$tmp" "$payload" || { rm -f -- "$tmp"; return 1; }
+}
+
 # The OWNER column bin/fm-procevent.sh already publishes: live, none,
 # orphaned, or uncertain. Empty means the source is not registered at all.
 source_owner() {  # <source-id>
@@ -368,11 +469,16 @@ command_build() {
   [ "$(grep -cxF "$PLACEHOLDER" "$TEMPLATE")" -eq 1 ] \
     || fail "board template does not carry exactly one data slot: $TEMPLATE"
 
+  board=$(board_path)
   effective=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-bearings-payload.XXXXXX") \
     || fail "cannot stage the board payload"
   if ! effective_payload "$data" "$effective"; then
     rm -f -- "$effective"
     fail "cannot reconcile the board payload against landed work"
+  fi
+  if ! stage_context_reports "$effective" "${board%/*}"; then
+    rm -f -- "$effective"
+    fail "cannot stage the reports the Captain's Call cards cite"
   fi
   json=$(jq -c . "$effective") || { rm -f -- "$effective"; fail "cannot compact the board data"; }
   rm -f -- "$effective"
@@ -380,7 +486,6 @@ command_build() {
   # occurrence keeps the payload valid JSON while making </script> inert.
   json=${json//</\\u003c}
 
-  board=$(board_path)
   (umask 077; mkdir -p "${board%/*}") || fail "cannot create ${board%/*}"
   tmp=$(umask 077; mktemp "${board%/*}/.board.XXXXXX") || fail "cannot stage the board"
   if ! BOARD_JSON="$json" perl -pe "s/^\\Q$PLACEHOLDER\\E\$/\$ENV{BOARD_JSON}/" "$TEMPLATE" > "$tmp"; then

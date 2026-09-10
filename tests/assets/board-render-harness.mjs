@@ -5,7 +5,9 @@
 // Usage: node board-render-harness.mjs <built-board.html>
 // Prints one JSON document:
 //   { stats:[{n,label}], underway:[{title,sub,badges}],
-//     charted:[{title,sub,badges,pickable}], empty, more, error }
+//     charted:[{title,sub,badges,pickable}],
+//     call:[{title, context:{summary, entries:[{label,source,href,html}]}}],
+//     empty, more, error }
 import { readFileSync } from "node:fs";
 
 const html = readFileSync(process.argv[2], "utf8");
@@ -24,9 +26,16 @@ class Node {
     this.type = "";
     this.value = "";
     this.checked = false;
+    const classes = () => this.className.split(/\s+/).filter(Boolean);
     this.classList = {
-      add: (c) => { this.className = (this.className + " " + c).trim(); },
-      contains: (c) => this.className.split(/\s+/).includes(c),
+      add: (c) => { if (!classes().includes(c)) this.className = (this.className + " " + c).trim(); },
+      remove: (c) => { this.className = classes().filter((x) => x !== c).join(" "); },
+      contains: (c) => classes().includes(c),
+      toggle: (c, on) => {
+        const want = on === undefined ? !classes().includes(c) : !!on;
+        if (want) this.classList.add(c); else this.classList.remove(c);
+        return want;
+      },
     };
   }
   get textContent() {
@@ -111,6 +120,45 @@ const rowsOf = (container) =>
 const uw = byId.get("bb-underway") || new Node("div");
 const underway = rowsOf(uw);
 
+// Captain's Call cards, including the cited-report disclosure the template
+// builds under the decide row.
+const hasClass = (n, c) => n.className.split(/\s+/).includes(c);
+const findDeep = (n, c) => {
+  for (const child of n.children) {
+    if (hasClass(child, c)) return child;
+    const hit = findDeep(child, c);
+    if (hit) return hit;
+  }
+  return null;
+};
+const deck = byId.get("bb-call") || new Node("div");
+const call = deck.children
+  .filter((c) => hasClass(c, "bb-decision"))
+  .map((card) => {
+    const disclosure = findDeep(card, "bb-ctxdoc");
+    let context = null;
+    if (disclosure) {
+      const body = findDeep(disclosure, "bb-ctxdoc__body");
+      context = {
+        summary: disclosure.children.find((c) => hasClass(c, "bb-ctxdoc__sum"))?.textContent ?? "",
+        entries: (body?.children ?? []).map((entry) => {
+          const src = entry.children.find((c) => hasClass(c, "bb-ctxdoc__src"));
+          const link = src?.children.find((c) => c.tagName === "a");
+          return {
+            label: entry.children.find((c) => hasClass(c, "bb-ctxdoc__label"))?.textContent ?? "",
+            source: src?.textContent ?? "",
+            href: link ? link.href ?? "" : "",
+            html: entry.children.find((c) => hasClass(c, "bb-md"))?.innerHTML ?? "",
+          };
+        }),
+      };
+    }
+    return {
+      title: findDeep(card, "bb-decision__title")?.textContent ?? "",
+      context,
+    };
+  });
+
 const ch = byId.get("bb-charted") || new Node("div");
 const charted = rowsOf(ch);
 // A fail-closed render replaces the page body instead of the board sections, so
@@ -123,4 +171,4 @@ const empty = ch.children.filter((c) => c.className.includes("bb-empty")).map((c
 const more = ch.children.filter((c) => c.className.includes("bb-morechip")).map((c) => c.textContent);
 
 process.stdout.write(
-  JSON.stringify({ stats, underway, charted, empty, more, error: errorText }) + "\n");
+  JSON.stringify({ stats, underway, charted, call, empty, more, error: errorText }) + "\n");

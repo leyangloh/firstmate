@@ -305,8 +305,93 @@ test_build_refuses_malformed_payloads_before_touching_the_board() {
   set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
   [ "$rc" -ne 0 ] || fail "a non-HTTPS Landed PR URL was accepted"
 
+  # A cited-report context entry must carry evidence and must stay inside the
+  # home. An entry naming neither a report nor an excerpt is a code with no
+  # context, which is the exact problem the field exists to remove.
+  write_valid_payload "$data"
+  jq '.captains_call[0].context = [{"label":"R6","anchor":"section 4"}]' "$data" > "$data.tmp" \
+    && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a context entry with neither a report nor an excerpt was accepted"
+
+  write_valid_payload "$data"
+  jq '.captains_call[0].context = [{"label":"R6","markdown":(reduce range(8193) as $i (""; . + "x"))}]' \
+    "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "an oversize context excerpt was accepted instead of refused"
+
+  write_valid_payload "$data"
+  jq '.captains_call[0].context = [{"report":"/etc/passwd"}]' "$data" > "$data.tmp" \
+    && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "an absolute context report path was accepted"
+
+  write_valid_payload "$data"
+  jq '.captains_call[0].context = [{"report":"data/../../elsewhere/report.md"}]' "$data" > "$data.tmp" \
+    && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a context report path escaping the home was accepted"
+
+  write_valid_payload "$data"
+  jq '.captains_call[0].context = {"report":"data/x/report.md"}' "$data" > "$data.tmp" \
+    && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a non-array context was accepted"
+
   assert_absent "$board" "a refused payload still produced a board"
   pass "build refuses malformed payloads before touching the board"
+}
+
+# The excerpt alone is enough context; the served copy is what additionally
+# makes the cited report reachable from the board page, because Lavish serves
+# the artifact's own directory and the page cannot open a file:// URL.
+test_build_stages_cited_reports_beside_the_board() {
+  local home data board out staged extracted
+  home=$(make_home context-reports)
+  data="$home/payload.json"
+  board="$home/.lavish/bearings-board.html"
+  mkdir -p "$home/data/gb-risk-closeout-exports"
+  printf '# Report\n\n### R6 - supply pool\n\nThe closeout prices a different pool.\n' \
+    > "$home/data/gb-risk-closeout-exports/report.md"
+  write_valid_payload "$data"
+  jq '.captains_call[0].context = [
+    { "label": "R6 - closeout exports use a different supply pool",
+      "report": "data/gb-risk-closeout-exports/report.md",
+      "anchor": "section 4",
+      "markdown": "The closeout prices a different pool." },
+    { "label": "R7 - tracker money-gate asymmetry",
+      "markdown": "No report path on this one." },
+    { "label": "R9 - moved away",
+      "report": "data/gone/report.md" }
+  ]' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+
+  run_board "$home" build "$data" >/dev/null || fail "a payload carrying card context did not build"
+
+  staged=$(find "$home/.lavish" -name 'bearings-report-*.md' | wc -l | tr -d ' ')
+  [ "$staged" = 1 ] \
+    || fail "expected exactly the one existing cited report to be staged, found $staged"
+  extracted=$(extract_payload "$board")
+
+  # The entry whose report exists gains the served name; the entry whose report
+  # is gone keeps only its authoritative path, which the card still shows.
+  printf '%s' "$extracted" | jq -e '
+    .captains_call[0].context as $c
+    | ($c[0].report == "data/gb-risk-closeout-exports/report.md")
+      and ($c[0].report_href | test("^bearings-report-[0-9a-f]+\\.md$"))
+      and ($c[1] | has("report_href") | not)
+      and ($c[2].report == "data/gone/report.md")
+      and ($c[2] | has("report_href") | not)
+  ' >/dev/null || fail "the staged-report mapping is wrong: $extracted"
+
+  # A served copy that no card cites any more stops being served.
+  : > "$home/.lavish/bearings-report-deadbeef0000.md"
+  jq 'del(.captains_call[0].context)' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  run_board "$home" build "$data" >/dev/null || fail "a rebuild without card context failed"
+  staged=$(find "$home/.lavish" -name 'bearings-report-*.md' | wc -l | tr -d ' ')
+  [ "$staged" = 0 ] || fail "a rebuild left $staged stale served report copies behind"
+
+  assert_present "$board" "the context build produced no board"
+  pass "build serves each existing cited report beside the board and retires stale copies"
 }
 
 test_build_injects_binds_then_arms() {
@@ -771,6 +856,7 @@ test_build_refuses_a_nondecision_reconcile_value() {
 
 test_path_is_stable_and_home_scoped
 test_build_refuses_malformed_payloads_before_touching_the_board
+test_build_stages_cited_reports_beside_the_board
 test_charted_kind_is_optional_and_accepts_both_values
 test_build_injects_binds_then_arms
 test_registration_cannot_consume_before_any_origin_binding
