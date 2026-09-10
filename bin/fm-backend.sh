@@ -359,7 +359,26 @@ fm_backend_target_of_meta() {  # <meta-file>
     [ -n "$terminal" ] && { printf '%s' "$terminal"; return 0; }
   fi
   window=$(fm_meta_get "$meta" window)
-  [ -n "$window" ] && printf '%s' "$window"
+  [ -n "$window" ] || return 0
+  [ "$backend" = tmux ] && window=$(fm_backend_tmux_resolve_meta_window "$meta" "$window")
+  printf '%s' "$window"
+}
+
+# fm_backend_tmux_resolve_meta_window: the recorded tmux task window, resolved
+# through its recorded stable id when meta carries one (tmux_window_id= and
+# tmux_server_start=, written by fm-spawn.sh). A record without them - every
+# task spawned before the id was recorded - keeps its recorded name unchanged.
+# docs/tmux-backend.md "Window identity" owns the contract;
+# fm_backend_tmux_task_target owns the resolution table.
+fm_backend_tmux_resolve_meta_window() {  # <meta-file> <recorded-window>
+  local meta=$1 window=$2 wid started
+  wid=$(fm_meta_get "$meta" tmux_window_id)
+  started=$(fm_meta_get "$meta" tmux_server_start)
+  if [ -z "$wid" ] || [ -z "$started" ] || ! fm_backend_source tmux; then
+    printf '%s' "$window"
+    return 0
+  fi
+  fm_backend_tmux_task_target "$window" "$wid" "$started"
 }
 
 # fm_backend_validate_task_endpoint: validate a task cleanup record entirely
@@ -471,6 +490,7 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
         echo "REFUSED: tmux endpoint '$window' is malformed or does not belong to task $id; preserving task state." >&2
         return 1
       fi
+      window=$(fm_backend_tmux_resolve_meta_window "$meta" "$window")
       ;;
     herdr)
       [ "$binding" = "$id" ] || {

@@ -727,6 +727,7 @@ case "${1:-}" in
       printf '╭────╮\n│    │\n╰────╯\n'
     fi
     exit 0 ;;
+  # The explicit sess:win target must be an exact member of its session.
   list-windows) printf 'win\n'; exit 0 ;;
 esac
 exit 0

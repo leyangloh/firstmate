@@ -525,6 +525,7 @@ inbox_steer_escalate_unavailable() {  # <window> <task> <record>
     echo "error: stale wake was queued for $task but its inbox escalation marker could not be written" >&2
     exit 1
   fi
+  FM_WAKE_WHY='unhandled steer and the worker agent is dead or missing'
   wake "$reason"
 }
 
@@ -596,6 +597,7 @@ inbox_steer_check() {  # <window> <task>
         if [ -d "${rec%/*}" ]; then
           reason="stale: $w (steering-inbox ladder bookkeeping unwritable: ${rec%/*}/.ring-state cannot be written while $rec stays unhandled; the doorbell cannot advance toward escalation - inspect the inbox directory)"
           fm_wake_append stale "$w" "$reason" || exit 1
+          FM_WAKE_WHY='steer ladder state unwritable while the record stays unhandled'
           wake "$reason"
         fi
       fi
@@ -622,6 +624,7 @@ inbox_steer_check() {  # <window> <task>
         echo "error: stale wake was queued for $task but its inbox escalation marker could not be written" >&2
         exit 1
       fi
+      FM_WAKE_WHY='steer ring budget spent on an idle pane'
       wake "$reason"
       ;;
   esac
@@ -826,6 +829,62 @@ signal_turnend_panes_churned() {  # <file> ...
     fi
   done
   return 0
+}
+
+# What a repeated bare turn-end must differ in before it is worth a delivery:
+# the count of keyed or captain-relevant lines in the task's status log, the
+# steering inbox's next sequence (so the turn that answers a new firstmate steer
+# always delivers), and the task's spawn generation (so a respawn starts fresh).
+# Routine working: appends and the watcher's own doorbell re-rings change nothing.
+turnend_news_signature() {  # <task>
+  local task=$1 line news=0 seq=''
+  if [ -f "$STATE/$task.status" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in *'[key='*) news=$((news + 1)); continue ;; esac
+      if status_is_captain_relevant "$line"; then news=$((news + 1)); fi
+    done < "$STATE/$task.status"
+  fi
+  [ ! -d "$STATE/$task.inbox" ] || seq=$(fm_task_inbox_next_seq "$STATE/$task.inbox" 2>/dev/null || true)
+  printf 'v1 gen=%s news=%s steer=%s' "$(fm_meta_get "$STATE/$task.meta" spawn_gen)" "$news" "$seq"
+}
+
+# 0 when every file in the batch is a bare turn-end marker of a non-secondmate
+# task whose news signature is unchanged since that task's last DELIVERED
+# turn-end (.turnend-delivered-<task>, written by turnend_delivery_record). The
+# first turn-end after any news still delivers, which keeps the swallowed-finish
+# rule; a worker that stopped again with nothing new is still surfaced by the
+# staleness backbone once its moved pane settles, so the absorb loses no stop.
+# A secondmate is excluded because its idle pane never enters that backbone.
+signal_turnend_no_news() {  # <file> ...
+  local f base task marker
+  [ "$#" -gt 0 ] || return 1
+  for f in "$@"; do
+    base=${f##*/}
+    case "$base" in
+      *.turn-ended) task=${base%.turn-ended} ;;
+      *) return 1 ;;
+    esac
+    [ -n "$task" ] || return 1
+    [ "$(fm_meta_get "$STATE/$task.meta" kind)" != secondmate ] || return 1
+    marker="$STATE/.turnend-delivered-$task"
+    [ -f "$marker" ] || return 1
+    [ "$(cat "$marker" 2>/dev/null)" = "$(turnend_news_signature "$task")" ] || return 1
+  done
+  FM_SIGNAL_ABSORB_WHY='no new keyed or terminal status and no new steer since the last delivered turn-end'
+  return 0
+}
+
+# Record the news signature of every task whose turn-end marker is in a batch
+# that is being delivered. Best-effort: a missing record only means the next
+# repeated turn-end delivers, the pre-existing behavior.
+turnend_delivery_record() {  # <file> ...
+  local f base task
+  for f in "$@"; do
+    base=${f##*/}
+    case "$base" in *.turn-ended) task=${base%.turn-ended} ;; *) continue ;; esac
+    [ -n "$task" ] || continue
+    turnend_news_signature "$task" > "$STATE/.turnend-delivered-$task" 2>/dev/null || true
+  done
 }
 
 recorded_windows() {
@@ -1055,6 +1114,7 @@ EOF
     fi
     fm_wake_secondmate_stall_receipt_write "$task" "$row_key" || return 1
     fm_wake_secondmate_stall_marker_write "$task" "$row_key" || return 1
+    FM_WAKE_WHY='secondmate oldest queue row stalled outside an active turn'
     wake "$reason"
   done
   return 0
@@ -1193,6 +1253,7 @@ resurface_absorbed() {  # <window> <throttle-marker> <age> <reason> [scope] [min
   fi
   fm_wake_append stale "$win" "$reason" || exit 1
   if [ -n "$scope" ]; then printf '%s' "$scope" > "$throttle"; else date +%s > "$throttle"; fi
+  FM_WAKE_WHY='declared-wait or write-deferral recheck cadence elapsed, or a new declaration'
   wake "$reason"
 }
 
@@ -1697,6 +1758,7 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         fm_wake_append stale "$win" "$reason" || exit 1
         rm -f "$since_file"
         clear_write_tracking "$(window_key "$win")"
+        FM_WAKE_WHY='provably-working idle pane past its wedge window with no worktree writes'
         wake "$reason"
       fi
       ;;
@@ -1836,6 +1898,7 @@ busy_turn_bound_check() {  # <window> <task> <hash> <since-file> <escalation-fil
       if [ "$(cat "$STATE/.stale-$key" 2>/dev/null || true)" != "$declared" ]; then
         fm_wake_append stale "$win" "stale: $win" || exit 1
         printf '%s' "$declared" > "$STATE/.stale-$key"
+        FM_WAKE_WHY='away mode: busy over-age pane under a new declaration'
         wake "stale: $win"
       fi
       return 0
@@ -2138,6 +2201,7 @@ surface_nonterminal_stale() {  # <window> <hash> [dialog-name]
     triage_log "absorbed non-terminal stale (declared wait or open captain call already re-surfaced this window): $win"
     return 0
   fi
+  FM_WAKE_WHY='stable idle pane with no working proof, no admitted declared wait, not throttled'
   wake "$reason"
 }
 
@@ -2254,6 +2318,7 @@ procevent_surface_queued() {
   fi
   # shellcheck disable=SC2034 # Consumed by wake() in the separately linted transition owner.
   FM_WAKE_POST_OUTPUT_ACTION=procevent_surface_after_output
+  FM_WAKE_WHY='captured process-event result not yet surfaced'
   wake "$reason"
 }
 
@@ -2797,6 +2862,7 @@ if ! fm_pr_poll_retirement_recover_all "$STATE" "$SCRIPT_DIR/fm-pr-poll.sh"; the
   reason="check: rejected unauthenticated PR poll retirement receipts:$FM_PR_POLL_RETIREMENT_REJECTED"
   fm_wake_append check pr-poll-retirement "$reason" || exit 1
   touch "$STATE/.last-check"
+  FM_WAKE_WHY='invalid PR-poll retirement receipts at startup'
   wake "$reason"
 fi
 
@@ -2849,6 +2915,7 @@ resurface_after_downtime() {
     fi
     [ "$FM_RECOVERY_MARKER_ACTION" = recover ] || return 0
   fi
+  FM_WAKE_WHY='watcher downtime recovery re-presents queued wakes'
   wake "check: rearm-resurface"
 }
 
@@ -2954,6 +3021,7 @@ while :; do
   if inactive_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
     "$SCRIPT_DIR/fm-inactive-reconcile.sh" scan 2>/dev/null); then
     if [ -n "$inactive_out" ]; then
+      FM_WAKE_WHY='new inactive-outcome reconciliation obligation'
       wake "check: inactive-outcome"
     fi
   else
@@ -3074,11 +3142,13 @@ EOF
             triage_log "absorbed duplicate merged PR poll result for $id"
             continue
           fi
+          FM_WAKE_WHY='first merged outcome recorded for a PR poll'
           wake "$reason"
         fi
         pr_poll_control_release || exit 1
         fm_wake_append check "$c" "$reason" || exit 1
         touch "$STATE/.last-check"
+        FM_WAKE_WHY='authenticated state check printed output'
         wake "$reason"
       fi
       pr_poll_control_release || exit 1
@@ -3087,6 +3157,7 @@ EOF
       reason="check: rejected unauthenticated state checks:$rejected_checks"
       fm_wake_append check unauthenticated-state-checks "$reason" || exit 1
       touch "$STATE/.last-check"
+      FM_WAKE_WHY='unauthenticated state checks rejected'
       wake "$reason"
     fi
     touch "$STATE/.last-check"
@@ -3143,6 +3214,7 @@ EOF
     # status span, and the capture only once the authoritative verdict comes up short.
     FM_SIGNAL_SURFACE_ENDPOINTS=''
     FM_SIGNAL_NEEDS_DECISION_FILES=''
+    FM_SIGNAL_ABSORB_WHY=''
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
     signal_files_actionable $files
     signal_actionable=$?
@@ -3158,7 +3230,8 @@ EOF
     # bin/fm-supervise-daemon.sh).
     # shellcheck disable=SC2086  # same space-separated status-path list
     if afk_present || [ "$signal_actionable" -eq 0 ] \
-      || { ! signal_crew_provably_working $files && ! signal_turnend_panes_churned $files; }; then
+      || { ! signal_turnend_no_news $files && ! signal_crew_provably_working $files \
+        && ! signal_turnend_panes_churned $files; }; then
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
         file_reason="$reason"
@@ -3191,6 +3264,15 @@ EOF
       done <<EOF
 $FM_SIGNAL_SURFACE_ENDPOINTS
 EOF
+      # shellcheck disable=SC2086  # same space-separated status-path list
+      turnend_delivery_record $files
+      if afk_present; then
+        FM_WAKE_WHY='away mode: the daemon owns triage'
+      elif [ "$signal_actionable" -eq 0 ]; then
+        FM_WAKE_WHY='captain-relevant, decision, or unreadable status span'
+      else
+        FM_WAKE_WHY='no-verb signal with no working proof and news since the last delivered turn-end'
+      fi
       wake "$reason"
     else
       while IFS=$(printf '\t') read -r sf sig f; do
@@ -3214,9 +3296,12 @@ EOF
         done <<EOF
 $pending
 EOF
+        # shellcheck disable=SC2086  # same space-separated status-path list
+        turnend_delivery_record $files
+        FM_WAKE_WHY='benign signal whose classification commit failed'
         wake "$reason"
       fi
-      triage_log "absorbed benign $reason"
+      triage_log "absorbed benign $reason${FM_SIGNAL_ABSORB_WHY:+ ($FM_SIGNAL_ABSORB_WHY)}"
     fi
   fi
 
@@ -3288,6 +3373,7 @@ EOF
             stale_reason=$(stale_reason_naming_dialog "stale: $w" "$dialog")
             fm_wake_append stale "$w" "$stale_reason" || exit 1
             printf '%s' "$h" > "$sf"
+            FM_WAKE_WHY='away mode: new stale hash handed to the daemon'
             wake "$stale_reason"
           fi
         elif stale_is_terminal "$w" "$STATE"; then
@@ -3337,6 +3423,7 @@ EOF
                 *) stale_end=''; stale_ident='' ;;
               esac
               mark_surfaced "$stale_status" "$stale_end" "$stale_ident"
+              FM_WAKE_WHY='terminal status on a new stale hash, not provably working, no captain-call throttle'
               wake "$stale_reason"
             fi
           elif [ -e "$ssf" ]; then
@@ -3466,6 +3553,7 @@ EOF
     if afk_present; then
       fm_wake_append heartbeat heartbeat heartbeat || exit 1
       touch "$STATE/.last-heartbeat"
+      FM_WAKE_WHY='away mode: the daemon owns triage'
       wake "heartbeat"
     elif heartbeat_scan_finds_actionable; then
       # Backstop: a captain-relevant event the per-wake path absorbed by mistake.
@@ -3475,11 +3563,14 @@ EOF
       fm_wake_append heartbeat heartbeat heartbeat || exit 1
       touch "$STATE/.last-heartbeat"
       mark_all_captain_relevant_surfaced || true
+      FM_WAKE_WHY='heartbeat backstop found an unsurfaced captain-relevant span'
       wake "heartbeat"
     else
       if ! mark_all_captain_relevant_surfaced; then
         fm_wake_append heartbeat heartbeat heartbeat || exit 1
         touch "$STATE/.last-heartbeat"
+        # shellcheck disable=SC2034 # Read by wake's triage_log_delivered.
+        FM_WAKE_WHY='heartbeat surfaced-marker commit failed'
         wake "heartbeat"
       fi
       touch "$STATE/.last-heartbeat"

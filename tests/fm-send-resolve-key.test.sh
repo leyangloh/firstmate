@@ -73,6 +73,9 @@ case "${1:-}" in
     printf 'fakepane\n'; exit 0 ;;
   capture-pane) printf '╭────╮\n│    │\n╰────╯\n'; exit 0 ;;
   list-windows)
+    # `elsewhere` is a live window of some other session: the misuse case needs
+    # an explicit target that really exists, so the refusal it proves is the
+    # missing decision ledger and not an unreachable endpoint.
     printf '%s\n' fm-t1 fm-t2 fm-t3 fm-t4 fm-t5 fm-t6 fm-t7 fm-t8 fm-t9 fm-mate elsewhere
     exit 0 ;;
 esac

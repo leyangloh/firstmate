@@ -478,6 +478,8 @@ Task meta records `backend=` only for a non-default backend; an absent `backend=
 
 - A cmux task additionally records `cmux_workspace_id=` and `cmux_surface_id=`.
 
+- A tmux task spawned since window identity was recorded additionally records `tmux_window_id=` and `tmux_server_start=`, and a tmux record without them resolves by its `window=` name alone ([`tmux-backend.md`](tmux-backend.md#window-identity)).
+
 ### Task selectors
 
 Task selectors for `fm-peek.sh`, `fm-send.sh`, and `fm-crew-state.sh` resolve centrally through `fm_backend_resolve_selector`.

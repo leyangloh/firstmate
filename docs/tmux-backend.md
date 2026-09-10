@@ -44,6 +44,17 @@ Verify setup by spawning a small task and confirming its `fm-<id>` window appear
 
 ## Current behavior and safety
 
+### Window identity
+
+Spawn pins each task window against automatic and escape-sequence renames (`automatic-rename` and `allow-rename` off) immediately after creating it and before anything is launched in it.
+An explicit `tmux rename-window` from outside Firstmate still renames a pinned window, so the recorded `window=` name alone is not a stable identity.
+Spawn therefore also records the window's tmux id as `tmux_window_id=` and the server's start time as `tmux_server_start=`, because window ids are unique only within one server lifetime.
+Every task-endpoint read that goes through the shared metadata resolver or endpoint validation - peek, send, crew state, control, teardown, the watcher, and the session-start digest - finds the window by that id first and renames a drifted window back to its recorded `fm-<id>` name.
+A record without the id keeps resolving by name, and an id recorded under a different server lifetime is never trusted.
+A window whose id is gone reads absent; if another window now holds its recorded name, the task resolves to its own gone id, so that stranger is never mistaken for the task.
+Existence checks require exact membership in the session's live window inventory whenever that inventory is readable, because `tmux display-message -t <session>:<absent-window>` answers from the session's current window with success.
+`bin/backends/tmux.sh`'s `fm_backend_tmux_task_target` owns the resolution table.
+
 ### Agent liveness probe
 
 A target-existence check proves only that the pane exists.
@@ -109,6 +120,7 @@ Without that baseline, an `unknown` verdict is preserved untouched, so a busy-lo
 ```sh
 tests/fm-backend-tmux-smoke.test.sh
 tests/fm-tmux-agent-liveness.test.sh
+tests/fm-tmux-window-identity.test.sh
 tests/fm-harness-liveness-drift-live-e2e.test.sh
 tests/fm-composer-ghost.test.sh
 tests/fm-kimi-harness.test.sh

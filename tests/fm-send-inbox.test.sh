@@ -77,6 +77,8 @@ case "${1:-}" in
       printf '╭────╮\n│    │\n╰────╯\n'
     fi
     exit 0 ;;
+  # The recorded task window plus the explicit sess:win target's window, so
+  # exact-membership existence reads see both as live.
   list-windows) printf 'fm-t1\nwin\n'; exit 0 ;;
 esac
 exit 0
