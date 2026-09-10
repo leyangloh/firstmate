@@ -1259,6 +1259,33 @@ test_wait_no_turns_absent_keeps_the_previous_brief() {
   pass "fm-brief: without config/wait-no-turns the brief and drive text stay as they were"
 }
 
+# Every ship and scout scaffold carries the full task contract Firstmate fills
+# and a completion receipt whose report path the final done: line names.
+test_task_contract_and_completion_receipt() {
+  local home kind id brief heading
+  home="$TMP_ROOT/task-contract-home"
+  mkdir -p "$home/data"
+  for kind in no-mistakes direct-PR local-only scout; do
+    id="contract-$kind"
+    if [ "$kind" = scout ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1 || fail "$kind scaffold failed"
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "$kind" >/dev/null 2>&1 || fail "$kind scaffold failed"
+    fi
+    brief="$home/data/$id/brief.md"
+    grep -qxF 'Goal: {TASK}' "$brief" || fail "$kind brief lost the Goal: {TASK} fill line"
+    for heading in '### Scope' '### Paths and entry points' '### Established evidence to read first' \
+      '### Acceptance criteria' '### Authorized actions' '### Stop conditions' '# Completion receipt'; do
+      grep -qxF "$heading" "$brief" || fail "$kind brief missing $heading"
+    done
+    assert_grep "report=$home/data/$id/report.md" "$brief" "$kind brief: done line must name the report path"
+    assert_grep 'Receipt: repo and worktree path, branch, commit SHA, pushed or not' "$brief" \
+      "$kind brief missing the receipt line"
+    assert_grep 'with pass or fail' "$brief" "$kind brief missing pass/fail command evidence"
+  done
+  pass "fm-brief.sh: ship and scout scaffolds carry the task contract and completion receipt"
+}
+
 test_worker_role_scope() {
   local kind home brief
   home="$TMP_ROOT/worker-role"
@@ -1629,6 +1656,7 @@ test_crewmate_scaffolds_forbid_pool_administration() {
   pass "fm-brief.sh: every crewmate scaffold forbids administering the shared worktree pool"
 }
 
+test_task_contract_and_completion_receipt
 test_script_parses
 test_no_heredoc_in_command_substitution
 test_help_includes_entire_header
