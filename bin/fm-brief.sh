@@ -2,15 +2,25 @@
 # Scaffold a crewmate brief or persistent secondmate charter at
 # data/<task-id>/brief.md under the active firstmate home.
 # For ordinary tasks, the standard Setup/Rules/Definition-of-done contract is
-# filled in. Ship and scout `# Task` sections have two subsections Firstmate
-# fills before dispatch: `{TASK}` under `## Captain's intent` (the captain's
-# own ask plus the context needed to read it, including the substance of any
-# report, decision, or PR the ask refers to, without added speaker labels or
-# direct address) and `{FIRSTMATE_SPEC}`
+# filled in. Ship and scout `# Task` sections are a complete task contract
+# Firstmate fills before dispatch: the `Goal: {TASK}` line under
+# `## Captain's intent` (the captain's own ask plus the context needed to read
+# it, including the substance of any report, decision, or PR the ask refers
+# to, without added speaker labels or direct address), and `{FIRSTMATE_SPEC}`
 # under `## Firstmate spec` (build instructions, which are never the captain's
-# intent). bin/fm-dod-lib.sh owns the no-mistakes `--intent` contract those
+# intent) followed by its required contract subsections, each replacing its
+# one-line <hint>: Scope (in and out), Paths and entry points, Established
+# evidence to read first, Acceptance criteria, Authorized actions (and what
+# needs a decision), and Stop conditions.
+# bin/fm-dod-lib.sh owns the no-mistakes `--intent` contract those
 # subsections feed; bin/fm-spawn.sh refuses leftover placeholders and a
-# `## Captain's intent` line opening with a Captain label or address. Secondmate
+# `## Captain's intent` line opening with a Captain label or address.
+# Ship and scout scaffolds also carry a `# Completion receipt` section: the
+# task ends with data/<task-id>/report.md holding outcome, changed files,
+# commands run with pass or fail, unresolved issues and risks, evidence paths,
+# and a repo/worktree/branch/SHA/pushed receipt line, and the final `done:`
+# line ends with ` report=<that path>`. That report is the completion artifact
+# firstmate reads instead of re-deriving the outcome from the pane. Secondmate
 # charters still use a single `{TASK}` charter fill. Firstmate may adjust other
 # sections when the task genuinely deviates (e.g. working an existing external
 # PR instead of shipping a new one).
@@ -629,10 +639,28 @@ fi
 IFS= read -r -d '' TASK_SECTION <<'EOF' || true
 # Task
 ## Captain's intent
-{TASK}
+Goal: {TASK}
 
 ## Firstmate spec
 {FIRSTMATE_SPEC}
+
+### Scope
+In: <what this task changes or answers>. Out: <adjacent work it must not touch>.
+
+### Paths and entry points
+<files, commands, docs, or URLs to start from>
+
+### Established evidence to read first
+<existing reports, PRs, logs, or findings that already answer part of this; "none" if none>
+
+### Acceptance criteria
+<observable results that make this task done>
+
+### Authorized actions
+<what you may do without asking; what needs a decision from firstmate>
+
+### Stop conditions
+<when to stop and report instead of pressing on>
 EOF
 TASK_SECTION=${TASK_SECTION%$'\n'}
 
@@ -672,6 +700,21 @@ Base branch: $BASE_BRANCH"
 else
   SETUP_BASE="You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch."
 fi
+
+# The completion receipt is every ship and scout task's completion artifact:
+# firstmate reads it instead of re-deriving the outcome from the pane.
+IFS= read -r -d '' RECEIPT_SECTION <<EOF || true
+# Completion receipt
+Before your final \`done:\` line, write \`$DATA/$ID/report.md\` (ship tasks too); it must stand alone:
+- Outcome: what changed or what you found, in one short paragraph.
+- Changed files: every path you changed, or "none".
+- Commands run: each verification command run after your final change, with pass or fail.
+- Unresolved issues and risks: anything left open, or "none".
+- Evidence paths: logs, screenshots, or reports worth keeping.
+- Receipt: repo and worktree path, branch, commit SHA, pushed or not.
+End your final \`done:\` line with \` report=$DATA/$ID/report.md\`.
+EOF
+RECEIPT_SECTION=${RECEIPT_SECTION%$'\n'}
 
 if [ "$KIND" = scout ]; then
 if "$SCRIPT_DIR/fm-bootstrap.sh" lavish-compatible >/dev/null 2>&1; then
@@ -716,9 +759,11 @@ $SHARED_INFRA_RULE
 
 $WAIT_BLOCK$INBOX_SECTION
 
+$RECEIPT_SECTION
+
 # Definition of done
-Write your findings to \`$DATA/$ID/report.md\`.
-The report must stand alone: what you did, what you found, the evidence (commands run, output, file:line references), and what you recommend.
+Write your findings to \`$DATA/$ID/report.md\` in the Completion receipt shape above.
+Beyond the receipt, the report carries what you did, the evidence (commands run, output, file:line references), and what you recommend.
 $LAVISH_LINE
 Before reporting done, read and follow \`$FM_ROOT/.agents/skills/captain-hold-lifecycle/SKILL.md\` and pass its shared completion gate for the report and any visual review.
 When the report is complete, append \`done [at=<epoch>]: {one-line conclusion}\` to the status file and stop.
@@ -799,6 +844,8 @@ $WAIT_BLOCK$INBOX_SECTION
 # Project memory
 A project's \`AGENTS.md\` or \`CLAUDE.md\` is loaded into every agent session in that project, so edit it only to correct information that is factually wrong - including information your own change made wrong - and never to add knowledge because it is missing.
 A correction edits only the wrong text: do not run \`$FM_ROOT/bin/fm-ensure-agents-md.sh\`, create either file, or add sections, headings, or pointers alongside it.
+
+$RECEIPT_SECTION
 
 $DOD
 EOF

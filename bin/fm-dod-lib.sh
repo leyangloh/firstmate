@@ -263,15 +263,20 @@ fm_ship_rule_one() {  # <no-mistakes|direct-PR|local-only> <task-id> [branch] [<
   esac
 }
 
-# Return 0 when a Task subsection still consists only of its scaffold
-# placeholder. A missing file and legacy briefs carry no such placeholders.
+# Return 0 when a Task subsection still holds its scaffold placeholder: the
+# intent is only `{TASK}` or `Goal: {TASK}`, or the spec keeps a bare
+# `{FIRSTMATE_SPEC}` line above its contract subsections. A placeholder quoted
+# inside filled prose is not a leftover. A missing file and legacy briefs carry
+# no such placeholders.
 fm_brief_task_placeholders_present() {  # <file>
   local file=$1 intent spec
   [ -f "$file" ] || return 1
   intent=$(fm_brief_task_heading_body "$file" "## Captain's intent")
   spec=$(fm_brief_task_heading_body "$file" "## Firstmate spec")
-  [ "$(printf '%s' "$intent" | tr -d '[:space:]')" = '{TASK}' ] && return 0
-  [ "$(printf '%s' "$spec" | tr -d '[:space:]')" = '{FIRSTMATE_SPEC}' ] && return 0
+  case "$(printf '%s' "$intent" | tr -d '[:space:]')" in
+    '{TASK}'|'Goal:{TASK}') return 0 ;;
+  esac
+  printf '%s\n' "$spec" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -qxF '{FIRSTMATE_SPEC}' && return 0
   return 1
 }
 
@@ -313,6 +318,17 @@ fm_brief_marked_captain_words() {  # <task-body>
   '
 }
 
+# Print a brief's `## Captain's intent` body as the authorized `--intent`
+# string. The scaffold opens that body with a `Goal: ` label, which is
+# firstmate's prompt rather than the captain's words, so it is dropped from the
+# line that carries it; `--intent` must arrive with no label or address at all
+# (issue 4445). Only the first body line is considered, so a `Goal:` the captain
+# actually wrote further down survives.
+fm_brief_captain_intent_body() {  # <file>
+  fm_brief_task_heading_body "$1" "## Captain's intent" \
+    | sed '1s/^[[:space:]]*Goal:[[:space:]]*//'
+}
+
 fm_brief_intent_overlay() {  # <captain-intent>
   cat <<'EOF'
 
@@ -337,8 +353,10 @@ fm_brief_task_content_valid() {  # <file>
   fm_brief_task_heading_present "$file" "## Firstmate spec" && has_spec=1
   if [ "$has_intent" -eq 1 ] || [ "$has_spec" -eq 1 ]; then
     [ "$has_intent" -eq 1 ] && [ "$has_spec" -eq 1 ] || return 1
-    intent=$(fm_brief_task_heading_body "$file" "## Captain's intent")
-    spec=$(fm_brief_task_heading_body "$file" "## Firstmate spec")
+    # A bare `Goal:` label, contract subheadings, and unfilled one-line
+    # <hint> lines are scaffold, not content.
+    intent=$(fm_brief_task_heading_body "$file" "## Captain's intent" | sed 's/^[[:space:]]*Goal:[[:space:]]*$//')
+    spec=$(fm_brief_task_heading_body "$file" "## Firstmate spec" | grep -v -e '^[[:space:]]*###[[:space:]]' -e '^[[:space:]]*<[^>]*>[[:space:]]*$' -e '^In: <.*>\. Out: <.*>\.$')
     [ -n "$(printf '%s' "$intent" | tr -d '[:space:]')" ] || return 1
     [ -n "$(printf '%s' "$spec" | tr -d '[:space:]')" ] || return 1
     return 0
