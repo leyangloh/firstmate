@@ -4230,10 +4230,13 @@ else
     # id and pins the window name (automatic-rename/allow-rename off) so a captain's
     # non-default tmux config cannot rename the window away from fm-<id> once
     # treehouse cd's into the worktree. WT_TARGET carries that stable id for the
-    # rename-critical worktree-detection steps below; the persisted window= handle
-    # stays $T (the name form), which is safe now that rename is disabled.
+    # rename-critical worktree-detection steps below. The persisted window= handle
+    # stays $T (the name form); tmux_window_id= and tmux_server_start= record the
+    # stable identity the shared resolver uses when an explicit rename-window from
+    # outside firstmate drifts the name anyway (docs/tmux-backend.md "Window identity").
     WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
     WT_TARGET="$WID"
+    TMUX_SERVER_START=$(fm_backend_tmux_server_start)
     ;;
   herdr)
     # fm_backend_herdr_workspace_label resolves the target workspace from
@@ -5828,6 +5831,12 @@ preserve_relaunch_meta() {
   # default path's meta stays byte-identical (absent backend= means tmux;
   # data/fm-backend-design-d7's P1 compatibility contract).
   [ "$BACKEND" = tmux ] || echo "backend=$BACKEND"
+  # A relaunch adopts the recorded window, so its recorded identity passes
+  # through preserve_relaunch_meta unchanged.
+  if [ "$BACKEND" = tmux ] && [ "$RELAUNCH" -ne 1 ] && [ -n "${WID:-}" ] && [ -n "${TMUX_SERVER_START:-}" ]; then
+    echo "tmux_window_id=$WID"
+    echo "tmux_server_start=$TMUX_SERVER_START"
+  fi
   if [ "$BACKEND" = herdr ]; then
     echo "herdr_session=$HERDR_SES"
     echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"

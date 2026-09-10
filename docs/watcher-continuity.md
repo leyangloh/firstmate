@@ -397,7 +397,7 @@ Each record includes:
 - Successor disposition.
 
 The file is size-capped through `FM_WATCH_CYCLE_LOG_MAX_BYTES` and `FM_WATCH_CYCLE_LOG_KEEP_LINES`.
-`state/.watch-triage.log` remains only the watcher's bounded absorbed-wake debug log and carries no lifecycle semantics.
+`state/.watch-triage.log` remains only the watcher's bounded absorbed- and delivered-wake debug log and carries no lifecycle semantics.
 
 ### Grace, beacon, and stop signals
 

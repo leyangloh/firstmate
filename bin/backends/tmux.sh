@@ -129,6 +129,90 @@ EOF
   tmux rename-window -t "$found" "$wname" 2>/dev/null
 }
 
+# fm_backend_tmux_server_start: the running tmux server's start time (epoch
+# seconds), or empty on any tmux error. Paired with a window id in task meta
+# (tmux_server_start=, tmux_window_id=) because tmux window ids are unique only
+# within one server lifetime: a restarted server hands out @0, @1, ... again, so
+# an id alone could name an unrelated window after a restart.
+fm_backend_tmux_server_start() {
+  LC_ALL=C tmux list-windows -a -F '#{start_time}' 2>/dev/null | awk 'NR == 1 { print; exit }'
+}
+
+# fm_backend_tmux_task_target: resolve a recorded task window to a live target,
+# by its stable window id first and its recorded name second.
+#
+# A spawned window is pinned (automatic-rename and allow-rename off), but an
+# explicit `tmux rename-window` from outside firstmate still renames it, and a
+# name-based target then fails or - worse - tmux display-message silently falls
+# back to another window. So when the recorded id is live in the recorded
+# server, the window is authoritatively ours: a drifted name is re-pinned to
+# the recorded one and the recorded `session:name` form is printed, keeping every
+# name-keyed consumer (window_to_task, watcher state keys, teardown) unchanged.
+#   no id or server start recorded, or inventory unreadable -> <recorded> (legacy)
+#   different server start   -> <recorded>; the window died with its server
+#   id live, name drifted    -> re-pin, then <live-session>:<name>
+#   id live, re-pin refused  -> <live-session>:<id> (another window holds the name)
+#   id gone, name free       -> <recorded>, which every exact-inventory read
+#                               reports absent
+#   id gone, name reused     -> <session>:<id>, so the stranger holding the name
+#                               is never mistaken for the task
+fm_backend_tmux_task_target() {  # <recorded session:name> <window-id> <server-start>
+  local recorded=$1 wid=$2 started=$3 session name inventory live_start
+  local row_id row_session row_name live_session='' live_name='' name_holder=''
+  session=${recorded%%:*}
+  name=${recorded#*:}
+  case "$wid" in @[0-9]*) ;; *) printf '%s' "$recorded"; return 0 ;; esac
+  case "$wid" in @*[!0-9]*) printf '%s' "$recorded"; return 0 ;; esac
+  case "$started" in ''|*[!0-9]*) printf '%s' "$recorded"; return 0 ;; esac
+  # The fields are separated by '|', the separator fm_backend_tmux_window_id
+  # below already uses: tmux 3.8 rewrites a tab inside a -F format to '_' in
+  # the rendered output, which silently collapsed every row into one field and
+  # left this resolver answering the recorded name for a drifted window.
+  inventory=$(LC_ALL=C tmux list-windows -a \
+    -F '#{start_time}|#{window_id}|#{session_name}|#{window_name}' 2>/dev/null) \
+    || { printf '%s' "$recorded"; return 0; }
+  live_start=${inventory%%|*}
+  [ "$live_start" = "$started" ] || { printf '%s' "$recorded"; return 0; }
+  while IFS='|' read -r _ row_id row_session row_name; do
+    [ -n "$row_id" ] || continue
+    if [ "$row_id" = "$wid" ]; then
+      live_session=$row_session
+      live_name=$row_name
+    elif [ "$row_session" = "$session" ] && [ "$row_name" = "$name" ]; then
+      name_holder=$row_id
+    fi
+  done <<EOF
+$inventory
+EOF
+  if [ -z "$live_session" ]; then
+    if [ -n "$name_holder" ]; then printf '%s:%s' "$session" "$wid"; else printf '%s' "$recorded"; fi
+    return 0
+  fi
+  if [ "$live_name" = "$name" ]; then
+    printf '%s:%s' "$live_session" "$name"
+    return 0
+  fi
+  if [ "$live_session" != "$session" ] && tmux list-windows -t "$live_session" -F '#{window_name}' 2>/dev/null | grep -Fqx "$name"; then
+    name_holder=taken
+  fi
+  tmux set-window-option -t "$wid" automatic-rename off >/dev/null 2>&1 || true
+  tmux set-window-option -t "$wid" allow-rename off >/dev/null 2>&1 || true
+  if [ -z "$name_holder" ] && tmux rename-window -t "$wid" "$name" >/dev/null 2>&1; then
+    printf '%s:%s' "$live_session" "$name"
+  else
+    printf '%s:%s' "$live_session" "$wid"
+  fi
+}
+
+# fm_backend_tmux_window_member: 0 when <session>'s live window inventory holds
+# <window> exactly, as a window id (@N), index, or name.
+# fm_backend_tmux_window_id below owns the exact session-scoped resolution, so a
+# membership read can never be satisfied through one of tmux's prefix, pattern,
+# or active-window fallbacks.
+fm_backend_tmux_window_member() {  # <session> <window>
+  fm_backend_tmux_window_id "$1" "$2" >/dev/null
+}
+
 # fm_backend_tmux_current_path: the live pane's current working directory, or
 # empty on any tmux error. Mirrors fm-spawn.sh's worktree-discovery poll:
 # `tmux display-message -p -t "$T" '#{pane_current_path}'`.
@@ -444,6 +528,7 @@ fm_backend_tmux_agent_state() {  # <target>
   # renamed back, so this probe and every later name-targeted read or send
   # reach the task's own pane instead of reporting a live agent as missing.
   if ! printf '%s\n' "$windows" | grep -Fqx "$window" \
+    && ! { case "$window" in @[0-9]*) fm_backend_tmux_window_member "$session" "$window" ;; *) false ;; esac; } \
     && ! fm_backend_tmux_restore_window_name "$session" "$window"; then
     printf 'missing'
     return 0

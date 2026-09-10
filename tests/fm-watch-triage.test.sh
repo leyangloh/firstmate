@@ -6224,6 +6224,150 @@ test_procevent_marker_failure_exits_and_replays() {
   pass "marker failure exits through the shared wake owner, releases its lock, and replays later"
 }
 
+# --- delivered wakes are logged; repeated no-news turn-ends are absorbed ------
+# Every DELIVERED wake writes one `delivered <kind> key=<key> why=<reason>` line
+# beside the absorbed ones, so a delivery that produced no action is measurable.
+
+test_delivered_wake_logged_with_kind_key_and_reason() {
+  local dir state fakebin out pid
+  dir=$(make_case delivered-logged); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  : > "$state/task.turn-ended"
+  printf '5\n' > "$state/.heartbeat-streak"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available'
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "watcher did not deliver a turn-end whose crew is not provably working"
+  grep -F "delivered signal key=$state/task.turn-ended why=no-verb signal with no working proof" \
+    "$state/.watch-triage.log" >/dev/null \
+    || fail "delivered wake was not logged with kind, key, and reason: $(cat "$state/.watch-triage.log" 2>/dev/null)"
+  [ "$(cat "$state/.heartbeat-streak")" = 0 ] || fail "a non-heartbeat delivery did not reset the heartbeat backoff"
+  pass "a delivered wake is logged with its kind, key, and triage reason, and resets the heartbeat backoff"
+}
+
+test_repeated_turn_end_without_news_absorbed() {
+  local dir state fakebin out pid sig
+  dir=$(make_case turn-end-no-news); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available'
+
+  # Phase A: the first turn-end of an idle crew delivers (the swallowed-finish rule).
+  : > "$state/task.turn-ended"
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "first turn-end of an idle crew was not delivered"
+  [ -s "$state/.turnend-delivered-task" ] || fail "delivered turn-end did not record its news signature"
+  ack_stopped_cycle "$state" >/dev/null || fail "could not acknowledge the phase-A delivery"
+
+  # Phase B: another turn-end with no new keyed status and no new steer is absorbed.
+  sleep 1; touch "$state/task.turn-ended"; : > "$out"
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_absorbed "$state" "$pid" "no new keyed or terminal status and no new steer since the last delivered turn-end" \
+    || fail "repeated no-news turn-end was delivered: $(cat "$out")"
+  [ ! -s "$out" ] || fail "repeated no-news turn-end printed a wake reason: $(cat "$out")"
+  reap "$pid"
+  ack_stopped_cycle "$state" >/dev/null || fail "could not acknowledge the intentional phase-B watcher stop"
+
+  # Phase C: a new steering-inbox record makes the next turn-end news (the reply).
+  mkdir -p "$state/task.inbox/handled"
+  printf 'status please\n' > "$state/task.inbox/1.msg"
+  sleep 1; touch "$state/task.turn-ended"; : > "$out"
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "turn-end after a new steer was absorbed"
+  grep -F "signal: $state/task.turn-ended" "$out" >/dev/null || fail "turn-end after a new steer did not print its signal"
+  ack_stopped_cycle "$state" >/dev/null || fail "could not acknowledge the phase-C delivery"
+
+  # Phase D: a new keyed or terminal status line (already classified on its own)
+  # also makes the next turn-end news.
+  printf 'blocked: need a credential [key=cred]\n' > "$state/task.status"
+  sig=$(seen_sig "$state/task.status"); printf '%s' "$sig" > "$state/.seen-task_status"
+  sleep 1; touch "$state/task.turn-ended"; : > "$out"
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "turn-end after a new keyed status line was absorbed"
+  grep -F "signal: $state/task.turn-ended" "$out" >/dev/null || fail "turn-end after a new keyed status did not print its signal"
+  pass "a repeated turn-end with no new keyed status or steer is absorbed; a new steer or keyed line delivers again"
+}
+
+test_busy_working_note_absorbed_via_pane_verdict() {
+  local dir state fakebin out pid
+  dir=$(make_case busy-working-note); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  printf 'working: refactoring the parser\n' > "$state/task.status"
+  # No attributed run: the busy verdict from the semantic busy-state contract is
+  # the only working proof.
+  export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_absorbed "$state" "$pid" "absorbed benign signal: $state/task.status" \
+    || fail "a working: note from a busy worker was delivered: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "a working: note from a busy worker enqueued a wake"
+  reap "$pid"
+  pass "a working: note from a worker with a busy verdict is absorbed"
+}
+
+test_heartbeat_backoff_doubles_toward_the_cap() {
+  local dir state fakebin out pid i
+  dir=$(make_case heartbeat-backoff); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  # Streak 3 with a 1s base means an 8s interval; the last heartbeat was 3s ago.
+  printf '3\n' > "$state/.heartbeat-streak"
+  : > "$state/.last-heartbeat"; set_mtime $(( $(date +%s) - 3 )) "$state/.last-heartbeat"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 FM_HEARTBEAT_MAX=100 "$WATCH" > "$out" &
+  pid=$!
+  wait_poll_cycle "$state" "$pid" || { reap "$pid"; fail "watcher exited during an uncapped backoff window"; }
+  [ "$(cat "$state/.heartbeat-streak")" = 3 ] || fail "a heartbeat fired inside its doubled interval"
+  grep -F "absorbed heartbeat" "$state/.watch-triage.log" >/dev/null 2>&1 && fail "a heartbeat was scanned inside its doubled interval"
+  reap "$pid"
+  ack_stopped_cycle "$state" >/dev/null || fail "could not acknowledge the intentional uncapped-phase watcher stop"
+  printf '3\n' > "$state/.heartbeat-streak"
+  # The same streak under a 2s cap is already due, and is absorbed without a wake.
+  : > "$state/.last-heartbeat"; set_mtime $(( $(date +%s) - 3 )) "$state/.last-heartbeat"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 FM_HEARTBEAT_MAX=2 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    [ "$(cat "$state/.heartbeat-streak")" -ge 4 ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1; i=$((i + 1))
+  done
+  [ "$(cat "$state/.heartbeat-streak")" -ge 4 ] || fail "the heartbeat cap did not bound the doubled interval"
+  [ ! -s "$out" ] || fail "a capped no-change heartbeat printed a wake reason: $(cat "$out")"
+  reap "$pid"
+  pass "an unchanged fleet's heartbeat interval doubles per absorbed heartbeat and is bounded by FM_HEARTBEAT_MAX"
+}
+
+test_wedge_stale_does_not_repeat_inside_its_window() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case wedge-no-repeat); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-quiet"
+  printf 'idle building output' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/quiet.meta"
+  printf 'working: still compiling\n' > "$state/quiet.status"
+  sig=$(seen_sig "$state/quiet.status"); printf '%s' "$sig" > "$state/.seen-quiet_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle building output")
+  # State right after a wedge escalation: the hash is classified and the timer
+  # was cleared by the escalation itself.
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · ci running'
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=30 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_poll_cycle "$state" "$pid" || ! wait_poll_cycle "$state" "$pid"; then
+    reap "$pid"; fail "an already-escalated unchanged pane escalated again inside its window: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "an unchanged pane printed a stale wake inside its window: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "an unchanged pane enqueued a stale wake inside its window"
+  [ -s "$state/.stale-since-$key" ] || fail "the next wedge window was not re-armed"
+  reap "$pid"
+  pass "a stale wake for an unchanged worker does not repeat inside its escalation window"
+}
+
 # --- heartbeat: no-change absorbed, backstop surfaces a missed status --------
 
 test_heartbeat_no_change_absorbed() {
@@ -6905,6 +7049,11 @@ test_procevent_surface_serializes_with_drain
 test_procevent_surface_crash_boundaries
 test_procevent_marker_failure_exits_and_replays
 test_heartbeat_no_change_absorbed
+test_heartbeat_backoff_doubles_toward_the_cap
+test_delivered_wake_logged_with_kind_key_and_reason
+test_repeated_turn_end_without_news_absorbed
+test_busy_working_note_absorbed_via_pane_verdict
+test_wedge_stale_does_not_repeat_inside_its_window
 test_heartbeat_backstop_surfaces_unsurfaced_status
 test_heartbeat_backstop_surfaces_a_masked_status
 test_beacon_stays_fresh_while_absorbing

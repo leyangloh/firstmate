@@ -88,6 +88,21 @@ triage_log() {
   fi
 }
 
+# Append one bounded best-effort line for a DELIVERED wake beside the absorbed
+# ones, so every delivery - and which of them produced no action - is measurable
+# from the one triage log. The kind is the reason's leading word, the key is
+# FM_WAKE_KEY or the rest of the reason, and FM_WAKE_WHY is the one-line reason
+# the delivery passed triage, set by the watcher site that calls wake.
+triage_log_delivered() {  # <reason>
+  local reason=$1 kind key
+  kind=${reason%%:*}
+  key=${FM_WAKE_KEY:-${reason#"$kind"}}
+  key=${key#:}
+  key=${key# }
+  [ -n "$key" ] || key=$kind
+  triage_log "delivered $kind key=$(watch_delivery_clean_reason "$key" | cut -c1-512) why=${FM_WAKE_WHY:-unclassified delivery}"
+}
+
 # Exit after reporting one actionable wake. Tests override this callback.
 wake() {
   local output_status=0
@@ -99,6 +114,7 @@ wake() {
   [ -z "$FM_WAKE_POST_OUTPUT_ACTION" ] || trap '' PIPE
   if echo "$1"; then
     output_status=0
+    triage_log_delivered "$1" || true
     watch_delivery_publish "$1" || true
     # shellcheck disable=SC2034 # Read by bin/fm-watch.sh's EXIT cleanup.
     FM_WATCH_DELIVERED_REASON=$1
@@ -168,5 +184,6 @@ handle_push_transition() {  # <backend> <session> <record>
   fm_wake_append stale "$window" "$reason" || exit 1
   fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
   mark_surfaced "$STATE/$task.status" "$surface_end" "$surface_ident"
+  FM_WAKE_WHY='native push transition is waiting on a human with no declared wait'
   wake "$reason"
 }
