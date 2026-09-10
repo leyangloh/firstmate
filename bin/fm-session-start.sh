@@ -143,10 +143,17 @@
 #   - `done` rows are never listed. Retained completion history belongs to the
 #     reporting surfaces (bin/fm-bearings-snapshot.sh, /ahoy), and at startup it
 #     is pure weight - 10 done rows cost 3.3KB in an observed main-home digest.
-#   - Every in-flight, held, and blocked row is listed IN FULL, with its
-#     hold_kind/hold_reason and blocked_by. Those are the rows AGENTS.md
-#     sections 7 and 10 make actionable at startup, so they are never bounded
-#     away.
+#   - Every in-flight, held, and blocked row is listed, with its identity,
+#     blocked_by, hold_kind, and hold_until. Those are the rows AGENTS.md
+#     sections 7 and 10 make actionable at startup, so no row is ever bounded
+#     away and no identity field is ever cut.
+#   - In-flight rows print in full. In the held and blocked groups only the
+#     free-text hold_reason cell is bounded, to FM_SESSION_START_REASON_CAP
+#     characters (default 160), in the same "... (truncated, N chars total -
+#     use show <id> --full to see complete text)" marker tasks-axi uses for its
+#     own title column; one observed home spent 29.5KB of a 50KB digest on 42
+#     complete reasons. The manual renderer bounds a queued title line's
+#     "(hold: ...)" text the same way.
 #   - Only the plain queued (dispatchable-now) listing is bounded, by
 #     FM_SESSION_START_QUEUED_LIMIT, default 20. Anything it omits is disclosed
 #     with an exact remainder count and the command that shows the rest, so a
@@ -397,7 +404,10 @@ case "$QUEUED_LIMIT" in ''|*[!0-9]*|0) QUEUED_LIMIT=20 ;; esac
 ENDPOINT_TIMEOUT=${FM_SESSION_START_ENDPOINT_TIMEOUT:-10}
 case "$ENDPOINT_TIMEOUT" in ''|*[!0-9]*) ENDPOINT_TIMEOUT=10 ;; esac
 [ "$ENDPOINT_TIMEOUT" -gt 0 ] 2>/dev/null || ENDPOINT_TIMEOUT=10
-BACKLOG_FIELDS=blocked_by,hold_kind,hold_reason
+REASON_CAP=${FM_SESSION_START_REASON_CAP:-160}
+case "$REASON_CAP" in ''|*[!0-9]*|0) REASON_CAP=160 ;; esac
+# hold_reason stays LAST so bounding it can never touch an identity field.
+BACKLOG_FIELDS=blocked_by,hold_kind,hold_until,hold_reason
 
 RULE='================================================================================'
 SUBRULE='--------------------------------------------------------------------------------'
@@ -438,9 +448,31 @@ MANUAL_KEEP_RE='[(]hold|blocked-by:'
 
 print_backlog_manual_compact() {
   local path=$1 reason=$2
-  printf 'compact backlog listing (%s; done rows omitted; every in-flight, held, and blocked title line kept; other queued bounded to %s; indented task bodies omitted)\n' \
-    "$reason" "$QUEUED_LIMIT"
-  awk -v max="$QUEUED_LIMIT" -v keep_re="$MANUAL_KEEP_RE" '
+  printf 'compact backlog listing (%s; done rows omitted; every in-flight, held, and blocked title line kept; queued hold reasons capped at %s characters; other queued bounded to %s; indented task bodies omitted)\n' \
+    "$reason" "$REASON_CAP" "$QUEUED_LIMIT"
+  fm_hold_reason_decode_stream markdown < "$path" \
+    | awk -v max="$QUEUED_LIMIT" -v keep_re="$MANUAL_KEEP_RE" -v cap="$REASON_CAP" '
+    # Bound only the "(hold: ...)" text of a queued title line. The markdown
+    # backend writes its (hold-kind: ...) and (hold-until: ...) markers after
+    # it, so they are peeled off first and re-attached untouched.
+    function bound_hold(line,    start, head, rest, suffix, reason, id) {
+      start = index(line, "(hold: ")
+      if (start == 0) return line
+      head = substr(line, 1, start + 6)
+      rest = substr(line, start + 7)
+      suffix = ""
+      while (match(rest, / [(]hold-[a-z]+: [^()]*[)]$/)) {
+        suffix = substr(rest, RSTART) suffix
+        rest = substr(rest, 1, RSTART - 1)
+      }
+      if (substr(rest, length(rest), 1) != ")") return line
+      reason = substr(rest, 1, length(rest) - 1)
+      if (length(reason) <= cap) return line
+      id = line
+      sub(/^[-*][[:space:]]+(\[[ xX]\][[:space:]]+)?/, "", id)
+      sub(/[[:space:]].*$/, "", id)
+      return head substr(reason, 1, cap) "... (truncated, " length(reason) " chars total - use show " id " --full to see complete text))" suffix
+    }
     function state_for_heading(line, heading) {
       heading = line
       sub(/^##[[:space:]]+/, "", heading)
@@ -460,7 +492,7 @@ print_backlog_manual_compact() {
     state == "done" && /^[-*][[:space:]]+/ { done_total++; next }
     state == "queued" && /^[-*][[:space:]]+/ {
       queued_total++
-      if ($0 ~ keep_re) { gated++; print $0; next }
+      if ($0 ~ keep_re) { gated++; print bound_hold($0); next }
       if (plain_shown < max) { plain_shown++; print $0 }
       next
     }
@@ -476,7 +508,7 @@ print_backlog_manual_compact() {
         }
       }
     }
-  ' "$path" | fm_hold_reason_decode_stream markdown
+  '
 }
 
 # tasks-axi closes every listing with its own help block. This section composes
@@ -514,6 +546,60 @@ print_ready_queued_bounded() {
   '
 }
 
+# Bound the hold_reason cell of every row under a tasks[N]{...} header to
+# REASON_CAP decoded characters, in the same marker shape tasks-axi uses for its
+# own title column, so `show <id> --full` stays one step away. The cell is found
+# by its column name in the header, cells are split only on commas outside TOON
+# quotes, and a cut never splits a backslash escape. Every other cell, and every
+# row, passes through byte-identical.
+bound_reason_rows() {
+  awk -v cap="$REASON_CAP" '
+    function cells(line, out,    n, i, c, q, cur) {
+      n = 0; q = 0; cur = ""
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+        if (q && c == "\\") { cur = cur c substr(line, i + 1, 1); i++; continue }
+        if (c == "\"") q = !q
+        if (c == "," && !q) { out[++n] = cur; cur = ""; continue }
+        cur = cur c
+      }
+      out[++n] = cur
+      return n
+    }
+    function bound(cell, id,    quoted, raw, i, c, kept, len) {
+      quoted = (cell ~ /^".*"$/)
+      raw = quoted ? substr(cell, 2, length(cell) - 2) : cell
+      kept = ""; len = 0
+      for (i = 1; i <= length(raw); i++) {
+        c = substr(raw, i, 1)
+        if (quoted && c == "\\") { c = c substr(raw, i + 1, 1); i++ }
+        else if (!quoted && (c == "\\" || c == "\"")) c = "\\" c
+        if (len < cap) kept = kept c
+        len++
+      }
+      if (len <= cap) return cell
+      return "\"" kept "\\n... (truncated, " len " chars total - use show " id " --full to see complete text)\""
+    }
+    /^[a-z_]+[[][0-9]+[]][{].*[}]:$/ {
+      col = 0
+      hdr = $0; sub(/^[^{]*[{]/, "", hdr); sub(/[}]:$/, "", hdr)
+      nh = split(hdr, names, ",")
+      for (j = 1; j <= nh; j++) if (names[j] == "hold_reason") col = j
+      print; next
+    }
+    col && /^[[:space:]]/ {
+      n = cells($0, f)
+      if (n < col) { print; next }
+      id = f[1]; sub(/^[[:space:]]+/, "", id)
+      f[col] = bound(f[col], id)
+      line = f[1]
+      for (j = 2; j <= n; j++) line = line "," f[j]
+      print line; next
+    }
+    { col = 0; print }
+  '
+}
+
 print_backlog_tasks_axi_compact() {
   local path=$1 in_flight held blocked ready err
   if ! in_flight=$(tasks-axi list --file "$path" --state in_flight --fields "$BACKLOG_FIELDS" 2>&1); then
@@ -525,14 +611,14 @@ print_backlog_tasks_axi_compact() {
   elif ! ready=$(tasks-axi ready --file "$path" 2>&1); then
     err=$ready
   else
-    printf 'compact backlog listing (tasks-axi; done rows omitted; every in-flight, held, and blocked row shown in full; ready queued bounded to %s; task bodies omitted)\n' \
-      "$QUEUED_LIMIT"
+    printf 'compact backlog listing (tasks-axi; done rows omitted; every in-flight, held, and blocked row listed; in-flight rows in full; held and blocked hold_reason capped at %s characters; ready queued bounded to %s; task bodies omitted)\n' \
+      "$REASON_CAP" "$QUEUED_LIMIT"
     printf '\nin flight:\n'
     printf '%s\n' "$in_flight" | fm_hold_reason_decode_stream | strip_axi_help
     printf '\nheld (captain- or time-gated; an in-flight item that is also held appears in both groups):\n'
-    printf '%s\n' "$held" | fm_hold_reason_decode_stream | strip_axi_help
+    printf '%s\n' "$held" | fm_hold_reason_decode_stream | strip_axi_help | bound_reason_rows
     printf '\nblocked queued:\n'
-    printf '%s\n' "$blocked" | fm_hold_reason_decode_stream | strip_axi_help
+    printf '%s\n' "$blocked" | fm_hold_reason_decode_stream | strip_axi_help | bound_reason_rows
     printf '\nready queued (dispatchable now):\n'
     print_ready_queued_bounded "$ready"
     return 0
