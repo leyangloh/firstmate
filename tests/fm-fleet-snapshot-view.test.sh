@@ -864,6 +864,138 @@ test_open_decision_survives_later_unrelated_event() {
   pass "durable fold keeps an open decision past a later unrelated event"
 }
 
+# The snapshot folds its private status copy starting from the drain's cursor,
+# reading only bytes appended since, and never writes that cursor. A cursor that
+# names another file or ends past the copy is ignored for a whole-copy fold.
+test_open_decisions_seed_from_drain_cursor_read_only() {
+  local home fakebin out status cursor probe cursor_before size_before size_after ident version i
+  home=$(make_home cursor-seed)
+  mkdir -p "$home/secondmate-home"
+  fm_write_meta "$home/state/seeded.meta" \
+    "window=firstmate:fm-seeded" \
+    "worktree=$home/secondmate-home" \
+    "project=$home/secondmate-home" \
+    "harness=codex" \
+    "kind=secondmate" \
+    "mode=secondmate" \
+    "home=$home/secondmate-home" \
+    "projects=alpha"
+  status="$home/state/seeded.status"
+  cursor="$home/state/.seeded.open-decisions-cursor"
+  probe="$home/probe.tsv"
+  printf 'needs-decision [key=route]: choose the route\n' > "$status"
+  i=0
+  while [ "$i" -lt 200 ]; do
+    printf 'working: routine filler line %03d\n' "$i" >> "$status"
+    i=$((i + 1))
+  done
+  bash -c '. "$1"; status_open_decisions_incremental "$2" >/dev/null' _ \
+    "$ROOT/bin/fm-classify-lib.sh" "$status"
+  [ -f "$cursor" ] || fail "the drain fold did not leave a cursor to seed from"
+  cursor_before=$(cat "$cursor")
+  size_before=$(LC_ALL=C wc -c < "$status" | tr -d ' ')
+  printf 'blocked [key=creds]: need a deploy token\n' >> "$status"
+  printf 'resolved [key=route]: took the east route\n' >> "$status"
+  size_after=$(LC_ALL=C wc -c < "$status" | tr -d ' ')
+  fakebin=$(make_fakebin "$home")
+
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_OPEN_DECISIONS_READ_PROBE="$probe" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "seeded")
+    | .hints.open_decisions == [{key:"creds",verb:"blocked",summary:"need a deploy token"}]
+      and .hints.blocked_event == true
+      and .hints.pending_decision == false
+  ' >/dev/null || fail "cursor-seeded fold disagrees with the whole log: $out"
+  assert_equals "$((size_after - size_before))" "$(grep -F "$status" "$probe" | tail -1 | cut -f2)" \
+    "the snapshot must fold only the bytes appended after the drain cursor"
+  assert_equals "$cursor_before" "$(cat "$cursor")" "the snapshot must never write the drain cursor"
+  [ -z "$(find "$home/state" -name '*.span.*' -o -name '*.read.*' -o -name '*.tmp.*')" ] \
+    || fail "the snapshot left fold scratch files in state"
+
+  # The seed is really read: a cursor that matches this file and ends at its
+  # end is taken as-is, forged record included. Without this, the two
+  # rejection cases below could pass by never consulting the cursor at all.
+  ident=$(bash -c '. "$1"; _fm_open_decisions_file_ident "$2"' _ "$ROOT/bin/fm-classify-lib.sh" "$status")
+  # A cursor's version token carries the task kind, and this fixture's task is a
+  # secondmate, so a forged seed must name that kind to be trusted at all.
+  version=$(bash -c '. "$1"; printf "%s:secondmate" "$FM_OPEN_DECISIONS_FOLD_VERSION"' _ "$ROOT/bin/fm-classify-lib.sh")
+  printf 'version=%s\noffset=%s\nident=%s\nghost\tneeds-decision\tforged seed' \
+    "$version" "$size_after" "$ident" > "$cursor"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    [.tasks[] | select(.id == "seeded") | .hints.open_decisions[].key] == ["ghost"]
+  ' >/dev/null || fail "a matching cursor at the copy end was not used as the seed: $out"
+
+  # Past the copy's end: never trusted.
+  printf 'version=%s\noffset=%s\nident=%s\nghost\tneeds-decision\tforged seed' \
+    "$version" "$((size_after + 100))" "$ident" > "$cursor"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    [.tasks[] | select(.id == "seeded") | .hints.open_decisions[].key] == ["creds"]
+  ' >/dev/null || fail "a cursor past the captured copy was trusted: $out"
+
+  # Same bytes, recreated file: the cursor names another identity, never trusted.
+  printf 'version=%s\noffset=%s\nident=%s\nghost\tneeds-decision\tforged seed' \
+    "$version" "$size_after" "$ident" > "$cursor"
+  cp -p "$status" "$status.new"
+  mv -f "$status.new" "$status"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    [.tasks[] | select(.id == "seeded") | .hints.open_decisions[].key] == ["creds"]
+  ' >/dev/null || fail "a cursor for a replaced status file was trusted: $out"
+  pass "snapshot open decisions seed read-only from a matching drain cursor and ignore any other"
+}
+
+# Local reads share a sliding window, so completion order differs from id order;
+# rows must still come out sorted by id with each read attributed to its own task.
+test_concurrent_task_reads_keep_id_order_and_attribution() {
+  local home fakebin out id worktree order
+  home=$(make_home sliding-window)
+  fakebin=$(make_fakebin "$home")
+  # task-a's pipeline read holds its slot until task-e's has run. A batch that
+  # waits for its slowest read before starting the next could never reach
+  # task-e while task-a is still waiting; a sliding window reaches it through
+  # the second slot, so task-a finishes last.
+  cat > "$fakebin/no-mistakes" <<'SH'
+#!/usr/bin/env bash
+if [ "$*" = "axi status" ]; then
+  case "${PWD##*/}" in
+    task-a)
+      i=0
+      while [ ! -e "$FAKE_NM_RELEASE" ] && [ "$i" -lt 60 ]; do sleep 0.1; i=$((i + 1)); done
+      ;;
+    task-e) : > "$FAKE_NM_RELEASE" ;;
+  esac
+  grep -qx "${PWD##*/}" "$FAKE_NM_ORDER" 2>/dev/null || printf '%s\n' "${PWD##*/}" >> "$FAKE_NM_ORDER"
+fi
+exit 0
+SH
+  chmod +x "$fakebin/no-mistakes"
+  for id in task-a task-b task-c task-d task-e; do
+    worktree="$home/projects/$id"
+    fm_git_init_commit "$worktree"
+    git -C "$worktree" checkout -qb "fm/$id"
+    fm_write_meta "$home/state/$id.meta" \
+      "window=firstmate:fm-$id" "worktree=$worktree" "project=alpha" \
+      "harness=codex" "kind=ship" "mode=no-mistakes"
+    printf 'done: finished %s\n' "$id" > "$home/state/$id.status"
+  done
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FAKE_NM_ORDER="$home/nm-order" \
+    FAKE_NM_RELEASE="$home/nm-release" FM_SNAPSHOT_LOCAL_READ_CONCURRENCY=2 "$SNAPSHOT" --json) \
+    || fail "sliding-window snapshot failed"
+  order=$(tr '\n' ' ' < "$home/nm-order")
+  assert_equals "task-a" "$(tail -1 "$home/nm-order")" \
+    "task-a's read must finish after later ids through the other slot (order: $order)"
+  printf '%s' "$out" | jq -e '
+    [.tasks[].id] == ["task-a","task-b","task-c","task-d","task-e"]
+      and all(.tasks[]; . as $t
+        | $t.hints.last_event_text == ("done: finished " + $t.id)
+          and ($t.paths.status_log.path | endswith("/" + $t.id + ".status"))
+          and ($t.paths.worktree.path | endswith("/" + $t.id)))
+  ' >/dev/null || fail "concurrent reads broke id order or crossed task attribution: $out"
+  pass "concurrent task reads keep id order and per-task attribution"
+}
+
 test_secondmate_open_decision_survives_live_endpoint() {
   local home fakebin out
   home=$(make_home active-secondmate)
@@ -1161,6 +1293,8 @@ test_main_inventory_orphan_and_unstructured_disclosure
 test_normalized_roles_and_plural_blocker_readiness
 test_event_hints_follow_reconciled_current_state
 test_open_decision_survives_later_unrelated_event
+test_open_decisions_seed_from_drain_cursor_read_only
+test_concurrent_task_reads_keep_id_order_and_attribution
 test_secondmate_open_decision_survives_live_endpoint
 test_open_decision_transfers_to_captain_hold
 test_open_decision_clears_on_keyed_resolution

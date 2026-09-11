@@ -37,15 +37,30 @@ case_dir() {  # <name>
   printf '%s' "$d"
 }
 
+# Fold a private copy of <status-file> the way the fleet snapshot does: seeded
+# read-only from the live log's cursor as the previous incremental call left it.
+captured_fold() {  # <status-file>
+  local f=$1 ident
+  mkdir -p "$f.captured"
+  ident=$(_fm_open_decisions_file_ident "$f")
+  cp -p "$f" "$f.captured/copy.status"
+  status_open_decisions_captured "$f.captured/copy.status" "$f" "$ident"
+}
+
 # Assert the whole-file fold of <status-file> equals <expected>, and that the
-# incremental fold agrees with it on the exact same input - the two consumption
-# strategies must never diverge on what is open.
+# captured-copy and incremental folds agree with it on the exact same input - the
+# consumption strategies must never diverge on what is open. The captured fold
+# runs before the incremental one, so on a grown log it starts from an older
+# cursor offset and folds only the appended span.
 assert_fold() {  # <status-file> <expected> <label>
-  local f=$1 expected=$2 label=$3 full incr
+  local f=$1 expected=$2 label=$3 full captured incr
   full=$(status_open_decisions "$f")
+  captured=$(captured_fold "$f")
   incr=$(status_open_decisions_incremental "$f")
   [ "$full" = "$expected" ] \
     || fail "$label: full fold mismatch: got '$full' want '$expected'"
+  [ "$captured" = "$full" ] \
+    || fail "$label: captured-copy fold diverged from the full fold: got '$captured' want '$full'"
   [ "$incr" = "$full" ] \
     || fail "$label: incremental fold diverged from the full fold: got '$incr' want '$full'"
 }
