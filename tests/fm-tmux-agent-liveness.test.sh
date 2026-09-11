@@ -303,6 +303,46 @@ fm_backend_tmux_foreground_comms "$SESSION:no-such-window" >/dev/null \
   || fail "an absent window in a readable session must classify missing, not whatever the fallback pane runs"
 pass "tmux liveness: an absent window classifies missing rather than inheriting tmux's active-window fallback"
 
+# --- a spawned window renamed away from its recorded name --------------------
+# Spawn pins automatic-rename and allow-rename off, but nothing stops an explicit
+# `tmux rename-window`; a Claude Code status hook renaming each window to
+# "<mark> <project>" made every busy worker read as missing, so steering skipped
+# its doorbell as if the agent had exited. The spawn-time stamp must resolve the
+# live agent, and the same resolution must still see a genuinely exited agent.
+
+renamed_wid=$(fm_backend_tmux_create_task "$SESSION" fm-renamed-live "$LAB/wt") \
+  || fail "could not create the stamped live window"
+"$REAL_TMUX" -L "$SOCKET" respawn-pane -k -t "$renamed_wid" -- "$LAB/bin/claude-link" 900 \
+  || fail "could not start the harness in the stamped live window"
+wait_for_state "$SESSION:fm-renamed-live" alive \
+  || fail "the stamped live window must classify alive before the rename"
+"$REAL_TMUX" -L "$SOCKET" rename-window -t "$renamed_wid" '● wt' \
+  || fail "could not rename the stamped live window"
+"$REAL_TMUX" -L "$SOCKET" list-windows -t "$SESSION" -F '#{window_name}' | grep -qx fm-renamed-live \
+  && fail "the rename did not take effect, so this case would prove nothing"
+[ "$(fm_backend_agent_state tmux "$SESSION:fm-renamed-live")" = alive ] \
+  || fail "a live agent in a window renamed away from its recorded name must classify alive, not missing"
+[ "$("$REAL_TMUX" -L "$SOCKET" display-message -p -t "$renamed_wid" '#{window_name}')" = fm-renamed-live ] \
+  || fail "resolving a renamed window must restore its recorded name for later name-targeted reads"
+pass "tmux liveness: a live agent in a renamed spawned window classifies alive and the name is restored"
+
+renamed_idle=$(fm_backend_tmux_create_task "$SESSION" fm-renamed-idle "$LAB/wt") \
+  || fail "could not create the stamped idle window"
+"$REAL_TMUX" -L "$SOCKET" respawn-pane -k -t "$renamed_idle" -- /bin/sh \
+  || fail "could not start the idle shell in the stamped window"
+"$REAL_TMUX" -L "$SOCKET" rename-window -t "$renamed_idle" '✓ wt' \
+  || fail "could not rename the stamped idle window"
+wait_for_state "$SESSION:fm-renamed-idle" dead \
+  || fail "an exited agent in a renamed spawned window must still classify dead"
+pass "tmux liveness: an exited agent in a renamed spawned window still classifies dead"
+
+new_window fm-unstamped "$LAB/bin/claude-link" 900
+"$REAL_TMUX" -L "$SOCKET" rename-window -t "$SESSION:fm-unstamped" '● other' \
+  || fail "could not rename the unstamped window"
+[ "$(fm_backend_agent_state tmux "$SESSION:fm-unstamped")" = missing ] \
+  || fail "a renamed window without the spawn stamp must stay missing rather than be guessed"
+pass "tmux liveness: a renamed window without the spawn stamp stays missing"
+
 # --- Cursor's composer: the terminal cursor is NOT a composer locator --------
 # Cursor Agent CLI parks its terminal cursor below its footer with cursor_flag 0,
 # so tmux's #{cursor_y} answers `unknown` for every Cursor pane state and the

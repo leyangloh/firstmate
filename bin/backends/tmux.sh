@@ -91,18 +91,42 @@ fm_backend_tmux_container_ensure() {
 #   - PIN the window name by disabling automatic-rename and allow-rename on the
 #     new window: the captain's tmux may rename the window away from fm-<id> once
 #     treehouse cd's into the worktree, which would break name-based targeting.
+#   - STAMP the window with the user option @fm_window=<window-name>. Pinning
+#     cannot stop an explicit `tmux rename-window` (for example a Claude Code
+#     hook that writes a status mark into the window name), and tmux keeps user
+#     options across renames, so the stamp is what lets
+#     fm_backend_tmux_restore_window_name find the window again.
 # The returned window id lets callers target the window even if its name is ever
 # lost, so worktree discovery cannot fall back to the active client's window.
 fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> -> prints window id
   local ses=$1 wname=$2 proj_abs=$3 wid
-  if tmux list-windows -t "$ses" -F '#{window_name}' | grep -qx "$wname"; then
+  if tmux list-windows -t "$ses" -F '#{window_name}' | grep -qx "$wname" \
+    || tmux list-windows -t "$ses" -F '#{@fm_window}' 2>/dev/null | grep -qx "$wname"; then
     echo "error: window $ses:$wname already exists" >&2
     return 1
   fi
   wid=$(tmux new-window -dP -F '#{window_id}' -t "$ses:" -n "$wname" -c "$proj_abs") || return 1
   tmux set-window-option -t "$wid" automatic-rename off 2>/dev/null || true
   tmux set-window-option -t "$wid" allow-rename off 2>/dev/null || true
+  tmux set-window-option -t "$wid" @fm_window "$wname" 2>/dev/null || true
   printf '%s\n' "$wid"
+}
+
+# fm_backend_tmux_restore_window_name: rename the ONE window in <session>
+# stamped @fm_window=<window-name> back to that name. Returns 1 when no window
+# or more than one window carries the stamp, so an unstamped renamed window
+# stays unresolved rather than being guessed from its contents.
+fm_backend_tmux_restore_window_name() {  # <session> <window-name>
+  local ses=$1 wname=$2 wid stamp found='' matches=0
+  while IFS='|' read -r wid stamp; do
+    [ -n "$wid" ] && [ "$stamp" = "$wname" ] || continue
+    found=$wid
+    matches=$((matches + 1))
+  done <<EOF
+$(tmux list-windows -t "$ses" -F '#{window_id}|#{@fm_window}' 2>/dev/null)
+EOF
+  [ "$matches" -eq 1 ] || return 1
+  tmux rename-window -t "$found" "$wname" 2>/dev/null
 }
 
 # fm_backend_tmux_current_path: the live pane's current working directory, or
@@ -416,7 +440,11 @@ fm_backend_tmux_agent_state() {  # <target>
     fi
     return 0
   fi
-  if ! printf '%s\n' "$windows" | grep -Fqx "$window"; then
+  # A window renamed away from its recorded name (the stamp survives) is
+  # renamed back, so this probe and every later name-targeted read or send
+  # reach the task's own pane instead of reporting a live agent as missing.
+  if ! printf '%s\n' "$windows" | grep -Fqx "$window" \
+    && ! fm_backend_tmux_restore_window_name "$session" "$window"; then
     printf 'missing'
     return 0
   fi
