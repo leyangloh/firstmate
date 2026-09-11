@@ -1267,56 +1267,63 @@ _fm_status_read_span() {  # <status-file> <start-offset> <byte-length>
   ' "$f" "$start" "$length"
 }
 
+# Parse persisted cursor bytes into _FM_ODC_VERSION (empty unless it equals the
+# caller's expected `<fold-version>:<kind>` token), _FM_ODC_OFFSET,
+# _FM_ODC_IDENT, and _FM_ODC_OPEN.
+# The one reader of the cursor format above; a malformed offset or ident line
+# yields offset 0 and an empty version. A cursor is trustworthy only when both
+# the version and the ident come back non-empty. Globals instead of stdout so a
+# caller reads all four fields without a subshell per field.
+_fm_open_decisions_cursor_parse() {  # <cursor-bytes> <expected-fold-version>
+  local data=$1 expect=$2 first rest offset_line ident_line
+  _FM_ODC_VERSION=''
+  _FM_ODC_OFFSET=0
+  _FM_ODC_IDENT=''
+  _FM_ODC_OPEN=''
+  first=${data%%$'\n'*}
+  case "$first" in version=*) ;; *) return 0 ;; esac
+  _FM_ODC_VERSION=${first#version=}
+  [ "$_FM_ODC_VERSION" = "$expect" ] || _FM_ODC_VERSION=''
+  rest=${data#*$'\n'}
+  offset_line=${rest%%$'\n'*}
+  case "$offset_line" in
+    offset=*) _FM_ODC_OFFSET=${offset_line#offset=} ;;
+    *) _FM_ODC_OFFSET=0; _FM_ODC_VERSION=''; return 0 ;;
+  esac
+  case "$_FM_ODC_OFFSET" in
+    ''|*[!0-9]*) _FM_ODC_OFFSET=0; _FM_ODC_VERSION=''; return 0 ;;
+  esac
+  case "$rest" in
+    *$'\n'*) rest=${rest#*$'\n'} ;;
+    *) _FM_ODC_OFFSET=0; _FM_ODC_VERSION=''; return 0 ;;
+  esac
+  ident_line=${rest%%$'\n'*}
+  case "$ident_line" in
+    ident=*)
+      _FM_ODC_IDENT=${ident_line#ident=}
+      case "$rest" in *$'\n'*) _FM_ODC_OPEN=${rest#*$'\n'} ;; esac
+      ;;
+    *) _FM_ODC_OFFSET=0; _FM_ODC_VERSION='' ;;
+  esac
+}
+
 status_open_decisions_incremental() {  # <status-file> [<captured-end-offset>]
-  local f=$1 captured_end=${2:-} cf offset ident open='' trusted_open='' cursor_data first rest offset_line ident_line
+  local f=$1 captured_end=${2:-} cf offset ident open='' trusted_open='' cursor_data=''
   local version='' size actual_size cur_ident resolve held chunk_file chunk_size line cursor_dirty=0
   local target_cursor kind fold_version
   [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 0
   kind=$(_fm_status_kind "$f")
   fold_version="$FM_OPEN_DECISIONS_FOLD_VERSION:$kind"
   cf=$(_fm_open_decisions_cursor_path "$f")
-  offset=0
-  ident=''
   if [ -f "$cf" ] && [ -r "$cf" ] && [ ! -L "$cf" ]; then
     cursor_data=$(LC_ALL=C command cat "$cf" 2>/dev/null) || cursor_data=''
   fi
-  if [ -n "${cursor_data:-}" ]; then
-      first=${cursor_data%%$'\n'*}
-      case "$first" in
-        version=*)
-          version=${first#version=}
-          [ "$version" = "$fold_version" ] || version=''
-          rest=${cursor_data#*$'\n'}
-          offset_line=${rest%%$'\n'*}
-          case "$offset_line" in
-            offset=*) offset=${offset_line#offset=} ;;
-            *) offset=0; version='' ;;
-          esac
-          case "$offset" in
-            ''|*[!0-9]*) offset=0; version='' ;;
-            *)
-              case "$rest" in
-                *$'\n'*)
-                  rest=${rest#*$'\n'}
-                  ident_line=${rest%%$'\n'*}
-                  case "$ident_line" in
-                    ident=*)
-                      ident=${ident_line#ident=}
-                      case "$rest" in
-                        *$'\n'*) open=${rest#*$'\n'} ;;
-                      esac
-                      if [ -n "$version" ] && [ -n "$ident" ]; then trusted_open=$open; fi
-                      ;;
-                    *) offset=0; version='' ;;
-                  esac
-                  ;;
-                *) offset=0; version='' ;;
-              esac
-              ;;
-          esac
-          ;;
-      esac
-  fi
+  _fm_open_decisions_cursor_parse "$cursor_data" "$fold_version"
+  version=$_FM_ODC_VERSION
+  offset=$_FM_ODC_OFFSET
+  ident=$_FM_ODC_IDENT
+  open=$_FM_ODC_OPEN
+  if [ -n "$version" ] && [ -n "$ident" ]; then trusted_open=$open; fi
 
   # A stat/size-read failure is a genuine I/O error, not "the file is empty" -
   # report the already-trusted persisted set unchanged rather than risking a
@@ -1404,6 +1411,70 @@ $open
 EOF
   done
   return 0
+}
+
+# Read-only sibling of status_open_decisions for a point-in-time consumer that
+# folds a private COPY of a live status log (bin/fm-fleet-snapshot.sh). It seeds
+# the fold from the live log's persisted cursor and folds only the copy's bytes
+# past that offset, so its cost is bounded by appends since the last drain rather
+# than by the log's lifetime. It never writes the cursor: cursor advancement
+# stays with the drain, which also seeds its presentation offset from it.
+#
+# <live-ident> is the live log's _fm_open_decisions_file_ident, read unchanged
+# before and after the copy was taken, which makes the copy a byte prefix of the
+# append-only file that identity names. The seed is used only when the cursor is
+# trustworthy, names that same identity, and ends at or before the copy's end;
+# a cursor ending at a line boundary of an append-only log folds to exactly what
+# the whole-file fold computes. Anything else - no identity, no cursor, a stale
+# fold version, a different file, a cursor past the copy, or any read failure -
+# falls back to status_open_decisions over the whole copy, so the answer never
+# depends on cursor state. The copy's directory must be private and writable: the
+# span past the offset is staged beside it.
+status_open_decisions_captured() {  # <captured-copy> <live-status-file> <live-ident> [<kind>]
+  local copy=$1 live=$2 live_ident=$3 kind=${4:-} cf cursor_data size span open line resolve held
+  [ -f "$copy" ] && [ -r "$copy" ] && [ ! -L "$copy" ] || return 0
+  # The copy carries no sibling .meta, so the kind the fold and the cursor's
+  # version token both depend on is read from the live log's own metadata.
+  kind=$(_fm_status_kind "$live" "$kind")
+  if [ -n "$live_ident" ]; then
+    cf=$(_fm_open_decisions_cursor_path "$live")
+    if [ -f "$cf" ] && [ -r "$cf" ] && [ ! -L "$cf" ] \
+      && cursor_data=$(LC_ALL=C command cat "$cf" 2>/dev/null) \
+      && size=$(_fm_status_file_size "$copy"); then
+      _fm_open_decisions_cursor_parse "$cursor_data" "$FM_OPEN_DECISIONS_FOLD_VERSION:$kind"
+      size=${size//[[:space:]]/}
+      case "$size" in ''|*[!0-9]*) size='' ;; esac
+      if [ -n "$size" ] && [ -n "$_FM_ODC_VERSION" ] && [ "$_FM_ODC_IDENT" = "$live_ident" ] \
+        && [ "$_FM_ODC_OFFSET" -le "$size" ]; then
+        open=$_FM_ODC_OPEN
+        if [ "$_FM_ODC_OFFSET" -lt "$size" ]; then
+          span="$copy.span.$$"
+          if _fm_status_read_span "$copy" "$_FM_ODC_OFFSET" "$((size - _FM_ODC_OFFSET))" > "$span" 2>/dev/null; then
+            # Same test-only observability seam as the incremental fold.
+            [ -n "${FM_OPEN_DECISIONS_READ_PROBE:-}" ] \
+              && printf '%s\t%s\n' "$live" "$((size - _FM_ODC_OFFSET))" >> "$FM_OPEN_DECISIONS_READ_PROBE"
+            resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
+            held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
+            while IFS= read -r line || [ -n "$line" ]; do
+              open=$(_fm_decision_fold_line "$open" "$line" "$resolve" "$held" "$kind")
+            done < "$span"
+            rm -f -- "$span"
+            printf '%s' "$open"
+            return 0
+          fi
+          rm -f -- "$span"
+        else
+          [ -n "${FM_OPEN_DECISIONS_READ_PROBE:-}" ] \
+            && printf '%s\t%s\n' "$live" 0 >> "$FM_OPEN_DECISIONS_READ_PROBE"
+          printf '%s' "$open"
+          return 0
+        fi
+      fi
+    fi
+  fi
+  [ -n "${FM_OPEN_DECISIONS_READ_PROBE:-}" ] \
+    && printf '%s\t%s\n' "$live" "full" >> "$FM_OPEN_DECISIONS_READ_PROBE"
+  status_open_decisions "$copy" "$kind"
 }
 
 status_presentation_snapshot() {  # <state>
@@ -1893,49 +1964,19 @@ EOF
 # mismatch, or offset past the current size falls back to 0. Never writes unless
 # a caller explicitly requests a migration snapshot.
 status_open_decisions_cursor_offset() {  # <status-file>
-  local f=$1 cf offset=0 ident='' version='' cursor_data first rest open=''
-  local offset_line ident_line cur_ident size fold_version
+  local f=$1 cf offset=0 ident='' version='' cursor_data open=''
+  local cur_ident size fold_version
   [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 1
   fold_version="$FM_OPEN_DECISIONS_FOLD_VERSION:$(_fm_status_kind "$f")"
   cf=$(_fm_open_decisions_cursor_path "$f")
   if [ -e "$cf" ] || [ -L "$cf" ]; then
     [ -f "$cf" ] && [ -r "$cf" ] && [ ! -L "$cf" ] || return 1
-    if cursor_data=$(LC_ALL=C command cat "$cf" 2>/dev/null); then
-      first=${cursor_data%%$'\n'*}
-      case "$first" in
-        version=*)
-          version=${first#version=}
-          [ "$version" = "$fold_version" ] || version=''
-          rest=${cursor_data#*$'\n'}
-          offset_line=${rest%%$'\n'*}
-          case "$offset_line" in
-            offset=*) offset=${offset_line#offset=} ;;
-            *) offset=0; version='' ;;
-          esac
-          case "$offset" in
-            ''|*[!0-9]*) offset=0; version='' ;;
-            *)
-              case "$rest" in
-                *$'\n'*)
-                  rest=${rest#*$'\n'}
-                  ident_line=${rest%%$'\n'*}
-                  case "$ident_line" in
-                    ident=*)
-                      ident=${ident_line#ident=}
-                      case "$rest" in *$'\n'*) open=${rest#*$'\n'} ;; esac
-                      ;;
-                    *) offset=0; version='' ;;
-                  esac
-                  ;;
-                *) offset=0; version='' ;;
-              esac
-              ;;
-          esac
-          ;;
-      esac
-    else
-      return 1
-    fi
+    cursor_data=$(LC_ALL=C command cat "$cf" 2>/dev/null) || return 1
+    _fm_open_decisions_cursor_parse "$cursor_data" "$fold_version"
+    version=$_FM_ODC_VERSION
+    offset=$_FM_ODC_OFFSET
+    ident=$_FM_ODC_IDENT
+    open=$_FM_ODC_OPEN
   fi
   cur_ident=$(_fm_open_decisions_file_ident "$f") || return 1
   [ -n "$cur_ident" ] || return 1
