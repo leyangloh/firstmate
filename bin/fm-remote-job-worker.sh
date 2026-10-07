@@ -35,6 +35,10 @@
 # and mode 0600 after verifying ownership, without waiting for the serving loop.
 # Losing lock ownership stops heartbeat refresh; losing the heartbeat process
 # while still owning the lock stops the serving loop on its next pass.
+# On Linux, a verified live worker other than this one holding the ownership lock
+# stops this serving loop on its next pass, because a replacement there is
+# started rather than booted by launchd and the two loops would otherwise
+# reclaim each other's running jobs.
 # The stale sweep, whose state preparation also re-applies the queue directories' 0700
 # modes, runs at startup and then at most every 60 seconds, never more rarely
 # than the shortest record reap age.
@@ -83,6 +87,7 @@ WORKER_LOCK_BOUND=
 WORKER_RELEASE_OWNERSHIP=1
 WORKER_SUPERVISED_PID=
 WORKER_HEARTBEAT_PID=
+WORKER_RETIRE_ON_LOST_OWNERSHIP=0
 WORKER_PREEMPTIBLE=0
 WORKER_PREEMPTED=0
 WORKER_LANE_HOME=
@@ -1199,6 +1204,20 @@ worker_wait_for_work() {
   sleep "$WORKER_IDLE_WAIT_SECONDS"
 }
 
+# Ruling a takeover out has to stay free of child processes, because every
+# serving pass runs it on an otherwise idle queue: the lock's own pid file names
+# this process in each healthy pass, so the costly identity verification runs
+# only once another pid has published itself as the owner.
+worker_queue_owned_by_other() { # <account-home>
+  local recorded
+  [ -f "$WORKER_LOCK/pid" ] && [ ! -L "$WORKER_LOCK/pid" ] || return 1
+  IFS= read -r recorded 2>/dev/null < "$WORKER_LOCK/pid" || return 1
+  case "$recorded" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$recorded" != "${BASHPID:-$$}" ] || return 1
+  fm_remote_job_lock_owner_matches_process "$1" || return 1
+  [ "$FM_REMOTE_JOB_OWNER_PID" != "${BASHPID:-$$}" ]
+}
+
 main() {
   local account_home identity lock_status next_sweep=0 sweep_interval
   account_home=$(worker_account_home) || { worker_error "cannot resolve account home"; exit 1; }
@@ -1221,6 +1240,11 @@ main() {
   worker_publish_pid || { worker_error "cannot publish worker pid"; exit 1; }
   worker_write_heartbeat "${BASHPID:-$$}" || { worker_error "cannot update worker heartbeat"; exit 1; }
   worker_start_heartbeat "$account_home"
+  # Linux replaces a worker by starting one and letting ownership decide, so a
+  # serving loop that lost the lock must retire rather than claim jobs beside
+  # the new owner. Darwin keeps its previous behavior: launchd's KeepAlive would
+  # restart this process straight back into the same unowned state.
+  [ "$(fm_remote_job_platform)" != linux ] || WORKER_RETIRE_ON_LOST_OWNERSHIP=1
   sweep_interval=$WORKER_SWEEP_SECONDS
   [ "$FM_REMOTE_JOB_STAGE_REAP_SECONDS" -ge "$sweep_interval" ] || sweep_interval=$FM_REMOTE_JOB_STAGE_REAP_SECONDS
   [ "$FM_REMOTE_JOB_REAP_SECONDS" -ge "$sweep_interval" ] || sweep_interval=$FM_REMOTE_JOB_REAP_SECONDS
@@ -1228,6 +1252,16 @@ main() {
   WORKER_FAST_REMAINING=0
   WORKER_ACTIVITY=1
   while :; do
+    # Another live worker has taken ownership of this queue. Two serving loops
+    # reclaim each other's running records and publish them as stopped before
+    # their commands finish, so the one that no longer owns the lock stops its
+    # own command tree and exits, leaving the owner's records untouched. A lock
+    # that is merely gone is not a replacement, and TERM stays the way that
+    # worker is stopped.
+    if [ "$WORKER_RETIRE_ON_LOST_OWNERSHIP" -eq 1 ] && worker_queue_owned_by_other "$account_home"; then
+      worker_error "another remote job worker owns this queue; stopping this one"
+      worker_exit_lost_lock
+    fi
     # The independent heartbeat keeps readiness fresh through slow serving
     # passes while ownership remains verifiable.
     if ! kill -0 "$WORKER_HEARTBEAT_PID" 2>/dev/null &&

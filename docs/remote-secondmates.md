@@ -85,12 +85,14 @@ Linux uses the same queue and worker protocol without the Aqua-session requireme
 The [`fm-remote-job-worker.sh` header](../bin/fm-remote-job-worker.sh) owns dispatch cadence and the quiet-scan latency for work arriving after its post-activity burst.
 Active-command and result waits use a separate sampling interval; the [`fm-remote-job-lib.sh` header](../bin/fm-remote-job-lib.sh) owns its defaults, overrides, and completion, cancellation, and timeout latency contract.
 
-On macOS, worker repair serializes the replacement decision and LaunchAgent reload with other callers, including its bounded startup wait.
+Worker repair serializes the replacement decision and the worker restart with other callers on both platforms, including its bounded startup wait.
 A live process tracked by launchd gets time to publish readiness even if the caller that started it disconnected before publication.
 Reload waits for launchd to finish removing the old service before bootstrap, with at most 100 sleeps of 0.1 seconds plus command and scheduling time; a timeout fails the repair instead of bootstrapping during removal.
 A verified lock owner running stale code or no longer tracked by launchd is stopped identity-safely before launchd starts the current worker.
 If readiness remains stale while a verified current, launchd-tracked lock owner is alive, the command fails with `remote-job: ready heartbeat stale while verified worker lock owner is alive` rather than reloading that worker merely for the stale heartbeat.
-The repair invariant is implemented in [`fm_remote_job_repair_launchagent`](../bin/fm-remote-job-lib.sh); heartbeat ownership and cadence are documented in the worker header above.
+Linux applies the same two rules without launchd: a verified live owner running current code is never joined by a second worker, and one running stale code has its whole tree stopped before the replacement starts.
+A Linux worker whose queue another live worker has taken ownership of stops itself on its next pass instead of serving that queue beside the new owner.
+The repair invariant is implemented in [`fm_remote_job_repair_launchagent`](../bin/fm-remote-job-lib.sh) and [`fm_remote_job_repair_linux_worker`](../bin/fm-remote-job-lib.sh); heartbeat ownership and cadence are documented in the worker header above.
 
 The independent heartbeat and live-owner check build on [Diabl0570's contribution](https://github.com/kunchenguid/firstmate/pull/6217), alongside [gearhead924's supervisor-multiplication work](https://github.com/kunchenguid/firstmate/pull/5851), addressing [remote reply reliability](https://github.com/kunchenguid/firstmate/issues/2921).
 
