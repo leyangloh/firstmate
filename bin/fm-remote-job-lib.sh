@@ -85,6 +85,14 @@
 # an Aqua requirement. The launch-agent renderer and repair helpers here are
 # shared by the entrypoint and remote doctor so their ownership cannot drift.
 #
+# Both platforms serialize the replacement decision and the bounded startup wait
+# behind a repair mutex, and neither ever starts a worker beside a verified live
+# one: a current worker whose readiness is merely stale is reported, a worker
+# running stale code is stopped tree-first, and only a dead or unverifiable owner
+# is replaced. Ownership records identify their process by a start token that
+# does not move with the wall clock, because a host whose clocks drift apart
+# otherwise invalidates its own records; fm_remote_job_process_start owns why.
+# FM_REMOTE_JOB_PROC_ROOT_OVERRIDE redirects that /proc read for isolated tests.
 # The Linux start path puts the worker tree in its own process group, so
 # stopping a worker signals its restart supervisor, its serving child, and any
 # job descendant together instead of leaving a supervisor to restart what was
@@ -968,23 +976,53 @@ fm_remote_job_worker_ready_path() { printf '%s\n' "$FM_REMOTE_JOB_STATE/worker.r
 fm_remote_job_worker_identity_path() { printf '%s\n' "$FM_REMOTE_JOB_STATE/worker.identity"; }
 fm_remote_job_worker_lock_path() { printf '%s\n' "$FM_REMOTE_JOB_STATE/worker.lock"; }
 
-# Pin LC_ALL=C so lstart's date format is locale-invariant: a lock or claim
-# owner recorded under one locale (de_DE renders "Fr. 16 Okt. ...") must still
-# verify under another, or the checker declares the live owner dead and a
-# second worker splits the queue.
+# The start half of every ownership record, and the only field that keeps a
+# reused pid from passing as the recorded process. A Linux-compatible /proc
+# publishes the kernel's own boot-relative start ticks, which stay fixed for the
+# life of a process. ps renders lstart from a boot time the kernel derives by
+# subtracting uptime from the wall clock instead, so a host whose realtime and
+# monotonic clocks drift apart re-renders that date for a process that never
+# restarted: WSL2 drifts by seconds per minute, which made every remote-job
+# ownership record stop verifying within seconds and read as a dead worker.
+# bin/fm-wake-lib.sh's fm_pid_identity resolves watcher identity the same way
+# and owns the shared rationale; this library repeats the technique rather than
+# sourcing it because it is copied to remote hosts on its own. Capability, not
+# uname, selects the source, because MSYS exposes a compatible /proc while its
+# ps rejects these fields.
+# On the ps fallback, pin LC_ALL=C so lstart's date format is locale-invariant:
+# a lock or claim owner recorded under one locale (de_DE renders
+# "Fr. 16 Okt. ...") must still verify under another, or the checker declares
+# the live owner dead and a second worker splits the queue.
 fm_remote_job_process_start() {
-  local pid=$1 ps_bin value
+  local pid=$1 ps_bin value proc_root stat_line
+  local -a stat_fields
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  proc_root=${FM_REMOTE_JOB_PROC_ROOT_OVERRIDE:-/proc}
+  if [ -r "$proc_root/$pid/stat" ]; then
+    IFS= read -r stat_line < "$proc_root/$pid/stat" || return 1
+    # After the final comm delimiter, array index 19 is proc stat field 22.
+    read -r -a stat_fields <<< "${stat_line##*)}"
+    [ "${#stat_fields[@]}" -ge 20 ] || return 1
+    value=${stat_fields[19]}
+    case "$value" in ''|*[!0-9]*) return 1 ;; esac
+    printf 'starttime=%s\n' "$value"
+    return 0
+  fi
   if [ -x /bin/ps ]; then ps_bin=/bin/ps; elif [ -x /usr/bin/ps ]; then ps_bin=/usr/bin/ps; else return 1; fi
-  value=$(LC_ALL=C "$ps_bin" -p "$pid" -o lstart= 2>/dev/null) || return 1
+  value=$(COLUMNS=10000 LC_ALL=C "$ps_bin" -p "$pid" -o lstart= 2>/dev/null) || return 1
   [ -n "$value" ] || return 1
   case "$value" in *$'\n'*|*$'\r'*) return 1 ;; esac
   printf '%s\n' "$value"
 }
 
+# Pin the width wide and the locale invariant for the same reason
+# fm_pid_identity does: procps cuts the command column to the ambient terminal
+# width, so a record written from a wide shell and re-read under a narrow
+# COLUMNS would reject its own live owner.
 fm_remote_job_process_command() {
   local pid=$1 ps_bin value
   if [ -x /bin/ps ]; then ps_bin=/bin/ps; elif [ -x /usr/bin/ps ]; then ps_bin=/usr/bin/ps; else return 1; fi
-  value=$("$ps_bin" -p "$pid" -o command= 2>/dev/null) || return 1
+  value=$(COLUMNS=10000 LC_ALL=C "$ps_bin" -p "$pid" -o command= 2>/dev/null) || return 1
   [ -n "$value" ] || return 1
   case "$value" in *$'\n'*|*$'\r'*) return 1 ;; esac
   printf '%s\n' "$value"
@@ -1409,12 +1447,30 @@ fm_remote_job_start_linux_worker() { # <remote-root> <account-home>
     return 1
   }
   fm_remote_job_prepare_state "$account_home" || return 1
+  pid=
   if fm_remote_job_worker_owned_alive "$root" "$account_home"; then
     if fm_remote_job_worker_identity_matches "$root" "$account_home"; then return 0; fi
+    pid=$FM_REMOTE_JOB_OWNER_PID
+  elif fm_remote_job_lock_owner_matches_process "$account_home"; then
+    # Readiness is stale or the published pid disagrees, but the shared pid,
+    # start, and command checks have verified this lock owner as a live worker.
+    # Starting beside it is the one outcome that must never happen: two serving
+    # loops reclaim each other's running records and publish them as stopped
+    # before their commands finish. Give a current worker its startup wait and
+    # report the stale heartbeat instead, exactly as the LaunchAgent repair path
+    # does; replace it only for stale code, and stop its whole tree first.
+    pid=$FM_REMOTE_JOB_OWNER_PID
+    if fm_remote_job_worker_identity_matches "$root" "$account_home"; then
+      fm_remote_job_wait_for_probe "$root" "$account_home" && return 0
+      fm_remote_job_stale_heartbeat_owner "$account_home" && return 1
+      # That owner stopped during the wait, so there is no live tree to stop.
+      pid=
+    fi
+  fi
+  if [ -n "$pid" ]; then
     # The owner pid is the serving child; its restart supervisor sits above it
     # and would immediately replace a lone process kill, so stop the whole
     # worker tree through its isolated group.
-    pid=$FM_REMOTE_JOB_OWNER_PID
     fm_remote_job_stop_worker_tree "$pid" || {
       FM_REMOTE_JOB_ERROR="stale remote job worker did not stop safely"
       return 1
@@ -1438,8 +1494,30 @@ fm_remote_job_start_linux_worker() { # <remote-root> <account-home>
   FM_REMOTE_JOB_REPAIRED=1
 }
 
+# Hold the Linux repair mutex across classification, replacement, and the
+# bounded startup waits. Without it two concurrent stagings each read a queue
+# whose worker has not published readiness yet and start a tree apiece; the
+# loser then reclaims the winner's lock and both serve the same queue. A
+# verified live owner after a failed probe wait blocks a restart here for the
+# same reason it blocks a LaunchAgent reload.
+fm_remote_job_repair_linux_worker() { # <remote-root> <account-home>
+  local root=$1 account_home=$2
+  fm_remote_job_start_linux_worker "$root" "$account_home" || return 1
+  fm_remote_job_wait_for_probe "$root" "$account_home" && return 0
+  fm_remote_job_stale_heartbeat_owner "$account_home" && return 1
+  # A replaced Linux supervisor can lose its first ownership race while the
+  # prior supervisor finishes releasing the shared worker lock. Retry the
+  # idempotent start once before reporting a startup failure.
+  fm_remote_job_start_linux_worker "$root" "$account_home" || return 1
+  FM_REMOTE_JOB_REPAIRED=1
+  fm_remote_job_wait_for_probe "$root" "$account_home" && return 0
+  # shellcheck disable=SC2034 # Sourceable API consumed by the entrypoint and remote doctor.
+  FM_REMOTE_JOB_ERROR="remote job worker did not report ready after startup"
+  return 1
+}
+
 fm_remote_job_ensure_worker() { # <remote-root> <account-home>
-  local root=$1 account_home=$2 platform uid
+  local root=$1 account_home=$2 platform uid lock status
   FM_REMOTE_JOB_ERROR=
   FM_REMOTE_JOB_REPAIRED=0
   root=$(fm_remote_job_canonical_existing_dir "$root") || {
@@ -1466,15 +1544,19 @@ fm_remote_job_ensure_worker() { # <remote-root> <account-home>
     fm_remote_job_ensure_launchagent "$root" "$account_home" "$uid"
     return
   fi
-  fm_remote_job_start_linux_worker "$root" "$account_home" || return 1
-  fm_remote_job_wait_for_probe "$root" "$account_home" && return 0
-  # A replaced Linux supervisor can lose its first ownership race while the
-  # prior supervisor finishes releasing the shared worker lock. Retry the
-  # idempotent start once before reporting a startup failure.
-  fm_remote_job_start_linux_worker "$root" "$account_home" || return 1
-  FM_REMOTE_JOB_REPAIRED=1
-  fm_remote_job_wait_for_probe "$root" "$account_home" && return 0
-  # shellcheck disable=SC2034 # Sourceable API consumed by the entrypoint and remote doctor.
-  FM_REMOTE_JOB_ERROR="remote job worker did not report ready after startup"
-  return 1
+  fm_remote_job_prepare_state "$account_home" || return 1
+  if fm_remote_job_worker_owned_alive "$root" "$account_home" &&
+    fm_remote_job_worker_identity_matches "$root" "$account_home"; then
+    return 0
+  fi
+  lock="$FM_REMOTE_JOB_STATE/worker.repair"
+  fm_remote_job_reload_lock_acquire "$lock" || {
+    # shellcheck disable=SC2034 # Sourceable API consumed by the entrypoint and remote doctor.
+    FM_REMOTE_JOB_ERROR="timed out waiting for the remote job worker repair lock"
+    return 1
+  }
+  fm_remote_job_repair_linux_worker "$root" "$account_home"
+  status=$?
+  fm_remote_job_reload_lock_release "$lock" || true
+  return "$status"
 }

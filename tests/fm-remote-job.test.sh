@@ -27,6 +27,8 @@ STALL_REPLACEMENT_PID=
 STALL_JOB_GROUP=
 QUIET_WORKER_PID=
 SCAN_LANE_PID=
+DUP_HEARTBEAT_STOPPED=
+DUP_TREE_PID=
 mkdir -p "$REMOTE_ROOT/bin" "$REMOTE_HOME" "$ACCOUNT_HOME" "$RUNTIME_BIN"
 # worker.pid records the serving child, not its restart supervisor, so stopping
 # that pid alone leaves the supervisor to respawn - the leak
@@ -40,6 +42,8 @@ cleanup_remote_job_fixture() {
   [ -z "$REPLACEMENT_OWNER_PID" ] || kill -KILL "$REPLACEMENT_OWNER_PID" 2>/dev/null || true
   [ -z "$QUIET_WORKER_PID" ] || kill -KILL "$QUIET_WORKER_PID" 2>/dev/null || true
   [ -z "$SCAN_LANE_PID" ] || kill -KILL "$SCAN_LANE_PID" 2>/dev/null || true
+  [ -z "$DUP_HEARTBEAT_STOPPED" ] || kill -CONT "$DUP_HEARTBEAT_STOPPED" 2>/dev/null || true
+  [ -z "$DUP_TREE_PID" ] || fm_remote_job_stop_worker_tree "$DUP_TREE_PID" || true
   local stall_pid
   for stall_pid in "$STALL_WORKER_PID" "$STALL_REPLACEMENT_PID"; do
     [ -n "$stall_pid" ] || continue
@@ -1243,6 +1247,7 @@ quiet_heartbeat_stays_fresh() { # <state> <account-home> <label>
 quiet_stage_completes() { # <state> <account-home> <touched> <label>
   local began=$SECONDS elapsed
   (
+    # shellcheck disable=SC2030 # This fixture deliberately keeps its state root inside its own subshell.
     FM_REMOTE_JOB_STATE_ROOT="$1"
     FM_REMOTE_JOB_QUEUE_TIMEOUT=60
     FM_REMOTE_JOB_TIMEOUT=30
@@ -1547,5 +1552,165 @@ RESTART_SUPERVISOR_PID=
 assert_grep "remote job worker exited 3 times; stopping the supervisor" "$TMP_ROOT/restart-supervisor.err" \
   "the restart guard did not explain why it stopped"
 pass "barely healthy worker failures remain bounded by the restart guard"
+
+# A live, identity-matching worker must never be joined by a second one. Stale
+# readiness with a verified live owner is the shape that produced two serving
+# trees on a Linux host, each publishing the other's running jobs as stopped.
+# One tree is one restart supervisor: the serving child and the heartbeat it
+# forks both carry the same --serve argv, so only the argument-free invocation
+# counts a tree.
+worker_tree_pids() {
+  local snapshot
+  snapshot=$(ps -eo pid=,command= 2>/dev/null || true)
+  printf '%s\n' "$snapshot" | awk -v worker="$REMOTE_ROOT/bin/fm-remote-job-worker.sh" \
+    'index($0, worker) && !index($0, worker " ") { print $1 }'
+}
+
+worker_tree_count() {
+  worker_tree_pids | grep -c . || true
+}
+
+worker_heartbeat_child() { # <serving-pid>
+  local snapshot
+  snapshot=$(ps -eo pid=,ppid=,command= 2>/dev/null || true)
+  # Print the first match without closing the pipe early, which would leave the
+  # writing printf reporting a broken pipe.
+  printf '%s\n' "$snapshot" | awk -v parent="$1" \
+    '$2 == parent && /fm-remote-job-worker.sh --serve/ && !found { print $1; found = 1 }'
+}
+
+# Earlier cases deliberately poison the shared queue, so these run on their own
+# state root from a baseline with no fixture worker alive.
+for DUP_LEFTOVER_PID in $(worker_tree_pids); do
+  fm_remote_job_stop_worker_tree "$DUP_LEFTOVER_PID" || true
+done
+[ "$(worker_tree_count)" -eq 0 ] || fail "the duplicate-worker fixture could not clear earlier worker trees"
+DUP_HOME="$TMP_ROOT/dup-account"
+mkdir -p "$DUP_HOME"
+chmod 700 "$DUP_HOME"
+# shellcheck disable=SC2031 # The cadence and quiet fixtures above confined their own state roots to their subshells.
+export FM_REMOTE_JOB_STATE_ROOT="$TMP_ROOT/dup-jobs"
+DUP_STATE="$TMP_ROOT/dup-jobs"
+fm_remote_job_ensure_worker "$REMOTE_ROOT" "$DUP_HOME" || fail "$FM_REMOTE_JOB_ERROR"
+DUP_OWNER_PID=$(cat "$DUP_STATE/worker.pid")
+DUP_TREE_PID=$DUP_OWNER_PID
+[ "$(worker_tree_count)" -eq 1 ] || fail "the duplicate-worker fixture did not start exactly one worker tree"
+DUP_HEARTBEAT_PID=$(worker_heartbeat_child "$DUP_OWNER_PID")
+[ -n "$DUP_HEARTBEAT_PID" ] || fail "the duplicate-worker fixture could not find the readiness heartbeat"
+DUP_HEARTBEAT_STOPPED=$DUP_HEARTBEAT_PID
+kill -STOP "$DUP_HEARTBEAT_PID" || fail "the duplicate-worker fixture could not stall the readiness heartbeat"
+touch -t 200001010000 "$DUP_STATE/worker.ready"
+! fm_remote_job_probe "$DUP_HOME" || fail "the stalled heartbeat fixture still reported fresh readiness"
+fm_remote_job_lock_owner_matches_process "$DUP_HOME" \
+  || fail "the stalled heartbeat fixture lost its verified live lock owner"
+! fm_remote_job_ensure_worker "$REMOTE_ROOT" "$DUP_HOME" \
+  || fail "ensure accepted a queue whose worker never reported ready"
+assert_contains "$FM_REMOTE_JOB_ERROR" 'ready heartbeat is stale' \
+  "ensure did not report the live owner's stale heartbeat"
+[ "$(worker_tree_count)" -eq 1 ] || fail "ensure started a second worker tree beside a live verified owner"
+[ "$(cat "$DUP_STATE/worker.pid")" = "$DUP_OWNER_PID" ] || fail "ensure replaced a live current worker"
+kill -CONT "$DUP_HEARTBEAT_PID" || fail "the duplicate-worker fixture could not resume the readiness heartbeat"
+DUP_HEARTBEAT_STOPPED=
+for _ in $(seq 1 100); do
+  fm_remote_job_probe "$DUP_HOME" && break
+  sleep 0.1
+done
+fm_remote_job_ensure_worker "$REMOTE_ROOT" "$DUP_HOME" || fail "$FM_REMOTE_JOB_ERROR"
+[ "$(cat "$DUP_STATE/worker.pid")" = "$DUP_OWNER_PID" ] || fail "a recovered worker was replaced anyway"
+[ "$(worker_tree_count)" -eq 1 ] || fail "recovery left more than one worker tree"
+fm_remote_job_stage "$DUP_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" fm-probe-job.sh < /dev/null > /dev/null
+JOB_ID=$FM_REMOTE_JOB_ID
+fm_remote_job_wait "$DUP_HOME" "$JOB_ID" || fail "$FM_REMOTE_JOB_ERROR"
+[ "$FM_REMOTE_JOB_EXIT" -eq 0 ] || fail "the surviving worker could not serve a job after the stalled heartbeat"
+fm_remote_job_reap "$DUP_HOME" "$JOB_ID" || fail "the post-recovery probe could not be reaped"
+pass "a stalled heartbeat reports its live worker instead of starting a second one"
+
+# The shape the WSL2 host produced: the live owner's recorded start no longer
+# matches what the kernel reports, so every file-based liveness check reads a
+# dead worker. Exactly one serving tree must come out of that, whichever one it
+# is, because two of them publish each other's running jobs as stopped.
+DRIFT_OWNER_PID=$(cat "$DUP_STATE/worker.pid")
+printf 'unverifiable\n' > "$DUP_STATE/worker.lock/start"
+! fm_remote_job_lock_owner_matches_process "$DUP_HOME" \
+  || fail "the unverifiable-record fixture still verified its lock owner"
+fm_remote_job_ensure_worker "$REMOTE_ROOT" "$DUP_HOME" || fail "$FM_REMOTE_JOB_ERROR"
+for _ in $(seq 1 400); do
+  [ "$(worker_tree_count)" -le 1 ] && break
+  sleep 0.1
+done
+[ "$(worker_tree_count)" -eq 1 ] \
+  || fail "an unverifiable ownership record left two worker trees serving one queue"
+fm_remote_job_worker_owned_alive "$REMOTE_ROOT" "$DUP_HOME" \
+  || fail "the surviving worker did not publish a verifiable ownership record"
+DUP_TREE_PID=$(cat "$DUP_STATE/worker.pid")
+fm_remote_job_stage "$DUP_HOME" "$REMOTE_ROOT" "$REMOTE_HOME" fm-probe-job.sh < /dev/null > /dev/null
+JOB_ID=$FM_REMOTE_JOB_ID
+fm_remote_job_wait "$DUP_HOME" "$JOB_ID" || fail "$FM_REMOTE_JOB_ERROR"
+[ "$FM_REMOTE_JOB_EXIT" -eq 0 ] \
+  || fail "the staged job did not survive the ownership handover"
+fm_remote_job_reap "$DUP_HOME" "$JOB_ID" || fail "the handover probe could not be reaped"
+[ "$(cat "$DUP_STATE/worker.pid")" != "$DRIFT_OWNER_PID" ] || [ "$(worker_tree_count)" -eq 1 ] \
+  || fail "the handover left the queue without a single recorded worker"
+pass "an unverifiable ownership record leaves exactly one serving worker"
+
+# Ownership taken over by another live worker leaves this serving loop with no
+# licence to claim jobs, so it retires rather than claim beside the new owner.
+# The takeover records are the new owner's and must come through untouched.
+DUP_RETIRE_PID=$(cat "$DUP_STATE/worker.pid")
+sleep 30 &
+OTHER_PID=$!
+printf '%s\n' "$OTHER_PID" > "$DUP_STATE/worker.lock/pid"
+fm_remote_job_process_start "$OTHER_PID" > "$DUP_STATE/worker.lock/start" \
+  || fail "the ownership-takeover fixture could not record its start token"
+fm_remote_job_process_command "$OTHER_PID" > "$DUP_STATE/worker.lock/command" \
+  || fail "the ownership-takeover fixture could not record its command"
+for _ in $(seq 1 300); do
+  [ "$(worker_tree_count)" -eq 0 ] && break
+  sleep 0.1
+done
+[ "$(worker_tree_count)" -eq 0 ] \
+  || fail "a worker whose queue another worker owns kept serving it"
+! kill -0 "$DUP_RETIRE_PID" 2>/dev/null \
+  || fail "the serving child kept running after another worker took its queue"
+[ "$(cat "$DUP_STATE/worker.lock/pid")" = "$OTHER_PID" ] \
+  || fail "the retiring worker rewrote the new owner's ownership record"
+DUP_TREE_PID=
+kill "$OTHER_PID" 2>/dev/null || true
+wait "$OTHER_PID" 2>/dev/null || true
+OTHER_PID=
+pass "a Linux worker retires when another live worker owns its queue"
+export FM_REMOTE_JOB_STATE_ROOT="$STATE_ROOT"
+
+# Ownership records must identify their process by something the kernel keeps
+# constant. A host whose boot time is recomputed from a drifting wall clock
+# re-renders ps lstart for a process that never restarted, which invalidated
+# every record within seconds; a restart or reused pid must still be rejected.
+proc_identity_case() (
+  local proc_root record pid stat_prefix
+  proc_root="$TMP_ROOT/proc-identity/proc"
+  record="$TMP_ROOT/proc-identity/record"
+  mkdir -p "$proc_root" "$record"
+  sleep 30 &
+  pid=$!
+  trap 'kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+  mkdir -p "$proc_root/$pid"
+  # A comm holding a space and a parenthesis is what the field walk has to
+  # survive, so the fixture reports one.
+  stat_prefix="$pid (sl) eep) S 1 1 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0"
+  printf '%s 55308 0 0\n' "$stat_prefix" > "$proc_root/$pid/stat"
+  export FM_REMOTE_JOB_PROC_ROOT_OVERRIDE="$proc_root"
+  printf '%s\n' "$pid" > "$record/pid"
+  fm_remote_job_process_start "$pid" > "$record/start" \
+    || fail "the kernel start token could not be read for a live process"
+  fm_remote_job_process_command "$pid" > "$record/command" \
+    || fail "the owner command could not be read for a live process"
+  fm_remote_job_recorded_owner_alive "$record" \
+    || fail "a live recorded owner did not verify from its kernel start token"
+  printf '%s 55309 0 0\n' "$stat_prefix" > "$proc_root/$pid/stat"
+  ! fm_remote_job_recorded_owner_alive "$record" \
+    || fail "a changed kernel start token still verified the recorded owner"
+  pass "ownership records verify a live owner by its kernel start token"
+)
+proc_identity_case || exit 1
 
 echo "ALL TESTS PASSED"
