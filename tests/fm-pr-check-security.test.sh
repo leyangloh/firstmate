@@ -473,6 +473,70 @@ UNSAFE_LIFECYCLE_IDS=(
   'task$a'
 )
 
+# A parked watch outlives the worker copy it was armed from. When the poll
+# template changes, every recorded check.sh has to be rewritten from the new
+# one, and the named-head verification cannot help: it reads a copy that
+# cleanup removed. Re-arming the exact pull request the task already records is
+# therefore exempt from that verification, while a first arm and a different
+# pull request still prove the head.
+test_rearm_of_recorded_pr_survives_a_removed_worktree() {
+  local dir state rc
+  dir=$(make_case rearm-worktree-gone)
+  state="$dir/home/state"
+  write_task_meta "$dir"
+  # No forge-reported head, as on every provider that cannot supply one, so the
+  # recorded pull request alone cannot stand in for the named head later.
+  FM_TEST_GH_HEAD=unavailable run_check_entry "$dir" task-a https://github.com/o/r/pull/11 \
+    > "$dir/stdout" 2> "$dir/stderr" || fail "first arm failed: $(cat "$dir/stderr")"
+  [ -f "$state/task-a.pr-poll" ] || fail "first arm wrote no poll sidecar"
+  ! grep -q '^pr_head=' "$state/task-a.meta" || fail "the fixture recorded a forge head"
+
+  # The copy is gone and the recorded body is stale, exactly as a changed
+  # bin/fm-pr-poll.sh leaves it.
+  rm -rf "$dir/wt"
+  printf 'stale body\n' > "$state/task-a.check.sh"
+  FM_TEST_GH_HEAD=unavailable run_check_entry "$dir" task-a https://github.com/o/r/pull/11 \
+    > "$dir/stdout" 2> "$dir/stderr" || fail "re-arm of the recorded PR failed: $(cat "$dir/stderr")"
+  cmp -s "$POLL" "$state/task-a.check.sh" \
+    || fail "re-arm did not rewrite the check from the current template"
+  fm_pr_poll_artifacts_valid "$state" task-a "$POLL" \
+    || fail "re-arm left the poll artifacts unauthenticated"
+  grep -qxF 'pr=https://github.com/o/r/pull/11' "$state/task-a.meta" \
+    || fail "re-arm did not keep the recorded pull request"
+
+  # A different pull request is a new claim, so it is verified as a first arm
+  # and refused while the copy is missing.
+  cp "$state/task-a.check.sh" "$dir/check.before"
+  set +e
+  FM_TEST_GH_HEAD=unavailable run_check_entry "$dir" task-a https://github.com/o/r/pull/12 \
+    > "$dir/stdout" 2> "$dir/stderr"; rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "a different pull request was armed with no worker copy"
+  grep -q 'worktree missing' "$dir/stderr" \
+    || fail "the refusal did not name the missing copy: $(cat "$dir/stderr")"
+  cmp -s "$dir/check.before" "$state/task-a.check.sh" \
+    || fail "the refused pull request rewrote the armed check"
+  grep -qxF 'pr=https://github.com/o/r/pull/11' "$state/task-a.meta" \
+    || fail "the refused pull request changed the recorded one"
+
+  # With no recorded poll at all there is nothing to re-arm, so the missing
+  # copy refuses the first arm as before.
+  dir=$(make_case rearm-first-arm-no-copy)
+  state="$dir/home/state"
+  write_task_meta "$dir"
+  rm -rf "$dir/wt"
+  set +e
+  FM_TEST_GH_HEAD=unavailable run_check_entry "$dir" task-a https://github.com/o/r/pull/11 \
+    > "$dir/stdout" 2> "$dir/stderr"; rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "a first arm was accepted with no worker copy"
+  grep -q 'worktree missing' "$dir/stderr" \
+    || fail "the first-arm refusal did not name the missing copy: $(cat "$dir/stderr")"
+  [ ! -e "$state/task-a.check.sh" ] || fail "a refused first arm armed a poll"
+  [ ! -e "$state/task-a.pr-poll" ] || fail "a refused first arm wrote a poll sidecar"
+  pass "re-arming a recorded pull request survives a removed copy while a first arm and a different PR do not"
+}
+
 test_parser_matrix() {
   local id row url owner repo number
   while IFS='|' read -r url owner repo number; do
@@ -3632,6 +3696,7 @@ test_invalid_entrypoints_have_zero_side_effects
 test_draft_pull_request_is_not_armed
 test_secondmate_record_refuses_a_pr_watch
 test_unpushed_named_head_refuses_registration
+test_rearm_of_recorded_pr_survives_a_removed_worktree
 test_direct_pr_unpushed_commit_refuses_registration
 test_valid_recording_and_merge_derivation
 test_rejected_metacharacter_bytes_are_inert

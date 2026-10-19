@@ -4,6 +4,10 @@
 # Refuses when bin/fm-dod-lib.sh will not accept the named head as reachable
 # outside the worker's disposable copy; in no-mistakes mode a forge-reported
 # head is that named head and is already stored on the forge.
+# Re-arming the same pull request this task already records skips that named
+# head verification, so a parked watch can be rewritten from the current poll
+# template after the worker's copy is gone; the exemption's bound and reasoning
+# are at RE_ARM below.
 # The watcher check source is byte-for-byte bin/fm-pr-poll.sh; task and PR data
 # live only in a private sidecar and are never interpolated into shell source.
 # A GitHub pull request URL, a GitLab merge request URL, and a Gerrit change URL
@@ -159,6 +163,30 @@ fi
 
 MODE=$(grep '^mode=' "$META" | tail -1 | cut -d= -f2- || true)
 PROJECT=$(grep '^project=' "$META" | tail -1 | cut -d= -f2- || true)
+
+# A re-arm of a pull request this task already records is exempt from the named
+# head verification below. A first arm has to prove the named head left the
+# worker's disposable copy, because recording a pull request is the claim that
+# the work is on the forge. Re-publishing the watch for the very same pull
+# request claims nothing new: the proof was given when it was first armed, and
+# the only thing that changes is the watcher body, which is rewritten from the
+# current bin/fm-pr-poll.sh through the same locks and validators as any other
+# arm. Without the exemption a change to that template strands every parked
+# watch whose worker copy has since been cleaned up, because the verification
+# reads the copy that is gone rather than the forge.
+# The exemption is bounded to an exactly matching recorded sidecar: a different
+# pull request, a sidecar that does not parse, or no sidecar at all is a first
+# arm and proves the head as before. Every other refusal still applies,
+# including the draft refusal above.
+RE_ARM=0
+if fm_pr_poll_data_parse "$STATE/$ID.pr-poll" \
+  && [ "$FM_PR_DATA_PROVIDER" = "$PROVIDER" ] && [ "$FM_PR_DATA_URL" = "$URL" ] \
+  && [ "$FM_PR_DATA_HOST" = "$HOST" ] && [ "$FM_PR_DATA_PATH" = "$PROJECT_PATH" ] \
+  && [ "$FM_PR_DATA_NUMBER" = "$NUMBER" ]; then
+  RE_ARM=1
+fi
+# The sidecar read above left the parser's globals describing the sidecar's URL.
+fm_pr_url_parse "$RAW_URL" || exit 1
 # The gate is asked about the ready report this task's worker was told to give;
 # on a Gerrit change both publishing modes report the same published line.
 case "$PROVIDER:$MODE" in
@@ -166,7 +194,8 @@ case "$PROVIDER:$MODE" in
   *:no-mistakes|*:) DONE_LINE="done: PR $URL checks green" ;;
   *) DONE_LINE="done: PR $URL" ;;
 esac
-if { [ -z "$PR_HEAD" ] || ! fm_dod_forge_head_is_named_head "$MODE"; } \
+if [ "$RE_ARM" != 1 ] \
+  && { [ -z "$PR_HEAD" ] || ! fm_dod_forge_head_is_named_head "$MODE"; } \
   && ! GATE_REASON=$(fm_dod_accept_ship_done "${KIND:-ship}" "$MODE" "$WT" "$PROJECT" "$DONE_LINE" "$STATE" "$ID" "$META"); then
   echo "error: $GATE_REASON" >&2
   exit 1
