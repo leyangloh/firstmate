@@ -141,6 +141,102 @@ EOF
   return 0
 }
 
+# Supported Node selection for supervision dispatch, whose owner imports TS.
+# config/supervision-node is a machine-local absolute executable pin; a bad pin
+# refuses rather than falling through. Without it, prefer the first supported
+# absolute PATH entry, normal Homebrew/system locations, then at most 32 nvm
+# installations. Each version probe is bounded to 3s by fm_run_timed.
+# Node must report a stable version >=24.11. No runtime is
+# installed, upgraded, or enabled with compatibility flags.
+# On success FM_SUPERVISION_NODE is the executable; on failure it is empty and
+# FM_SUPERVISION_NODE_PROBLEM names the path/version or discovery failure.
+fm_supervision_node_supported() {  # <candidate>
+  local candidate=$1 version major minor patch extra status
+  FM_SUPERVISION_NODE_PROBLEM="Node executable '$candidate' is missing or not executable"
+  [ -f "$candidate" ] && [ -x "$candidate" ] || return 1
+  if ! command -v fm_run_timed >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-timeout-lib.sh
+    . "$(dirname "${BASH_SOURCE[0]}")/fm-timeout-lib.sh" || return 1
+  fi
+  if version=$(fm_run_timed 3 "$candidate" --version 2>/dev/null); then
+    :
+  else
+    status=$?
+    if fm_timed_out "$status"; then
+      FM_SUPERVISION_NODE_PROBLEM="Node executable '$candidate' did not report its version within 3s"
+    else
+      FM_SUPERVISION_NODE_PROBLEM="Node executable '$candidate' could not report its version"
+    fi
+    return 1
+  fi
+  version=${version#v}
+  FM_SUPERVISION_NODE_PROBLEM="Node executable '$candidate' reports '$version'; supervision requires Node.js >=24.11"
+  IFS=. read -r major minor patch extra <<EOF
+$version
+EOF
+  case "$major:$minor:$patch:$extra" in *[!0-9:]*) return 1 ;; esac
+  [ -n "$major" ] && [ -n "$minor" ] && [ -n "$patch" ] && [ -z "$extra" ] || return 1
+  [ "${#major}" -le 6 ] && [ "${#minor}" -le 6 ] && [ "${#patch}" -le 6 ] || return 1
+  { [ "$major" -gt 24 ] || { [ "$major" -eq 24 ] && [ "$minor" -ge 11 ]; }; } || return 1
+  FM_SUPERVISION_NODE=$candidate
+  FM_SUPERVISION_NODE_PROBLEM=
+}
+
+fm_supervision_node_resolve() {  # <config-dir>
+  local file="$1/supervision-node" pin candidate rest directory last n=0
+  FM_SUPERVISION_NODE=
+  FM_SUPERVISION_NODE_PROBLEM=
+  if [ -e "$file" ] || [ -L "$file" ]; then
+    if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+      FM_SUPERVISION_NODE_PROBLEM="$file is not a readable Node executable pin"
+      return 1
+    fi
+    pin=
+    IFS= read -r pin < "$file" || [ -n "$pin" ] || true
+    if [ "$(awk 'END {print NR}' "$file")" != 1 ]; then
+      FM_SUPERVISION_NODE_PROBLEM="$file must contain exactly one absolute Node executable path"
+      return 1
+    fi
+    case "$pin" in
+      /*) ;;
+      *) FM_SUPERVISION_NODE_PROBLEM="$file names '$pin'; an absolute Node executable path is required"; return 1 ;;
+    esac
+    fm_supervision_node_supported "$pin"
+    return $?
+  fi
+  rest=${PATH:-}
+  while :; do
+    last=0
+    case "$rest" in
+      *:*) directory=${rest%%:*}; rest=${rest#*:} ;;
+      *) directory=$rest; last=1 ;;
+    esac
+    case "$directory" in
+      /*) fm_supervision_node_supported "$directory/node" && return 0 ;;
+    esac
+    [ "$last" = 0 ] || break
+  done
+  for candidate in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node; do
+    fm_supervision_node_supported "$candidate" && return 0
+  done
+  for candidate in "${HOME:-}/.nvm/versions/node"/v*/bin/node; do
+    [ "$n" -lt 32 ] || break
+    [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+    n=$((n + 1))
+    fm_supervision_node_supported "$candidate" && return 0
+  done
+  FM_SUPERVISION_NODE_PROBLEM="Node.js >=24.11 is required; no supported runtime was found on PATH, normal installation paths, or the first 32 nvm installations"
+  return 1
+}
+
+# The no-model dispatch entry used by tests and other direct consumers.
+fm_supervision_node() {  # <config-dir> <node-argument...>
+  local config=$1
+  shift
+  fm_supervision_node_resolve "$config" || { printf '%s\n' "$FM_SUPERVISION_NODE_PROBLEM" >&2; return 1; }
+  "$FM_SUPERVISION_NODE" "$@"
+}
+
 # fm_supervision_host_attended_ready <config-dir> <primary-harness>
 # 0 when the attended host's configured engine, executable, node, jq, turn
 # bound (perl, timeout, or gtimeout), and primary's mirror writer are ready;
@@ -155,8 +251,8 @@ fm_supervision_host_attended_ready() {
     FM_SUPERVISION_HOST_UNREADY="no supervision engine"
   elif ! fm_supervision_engine_bin "$FM_SUPERVISION_ENGINE" >/dev/null 2>&1; then
     FM_SUPERVISION_HOST_UNREADY="the $FM_SUPERVISION_ENGINE engine executable is missing"
-  elif ! command -v node >/dev/null 2>&1; then
-    FM_SUPERVISION_HOST_UNREADY="node is missing"
+  elif ! fm_supervision_node_resolve "$1"; then
+    FM_SUPERVISION_HOST_UNREADY=$FM_SUPERVISION_NODE_PROBLEM
   elif ! command -v jq >/dev/null 2>&1; then
     FM_SUPERVISION_HOST_UNREADY="jq is missing"
   elif ! command -v perl >/dev/null 2>&1 && ! command -v timeout >/dev/null 2>&1 \
@@ -424,7 +520,7 @@ fm_supervision_engine_result() {
   case "$1" in
     claude)
       # shellcheck disable=SC2016 # A literal Node program; ${...} is JavaScript.
-      node -e '
+      "${FM_SUPERVISION_NODE:-node}" -e '
         const fs = require("node:fs");
         let j;
         try { j = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch { process.exit(1); }

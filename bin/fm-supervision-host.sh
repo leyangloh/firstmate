@@ -755,7 +755,7 @@ choose_conversation() {
   ENGINE_SESSION=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]')
   case "$ENGINE_SESSION" in
     ????????-????-????-????-????????????) ;;
-    *) ENGINE_SESSION=$(node -e 'process.stdout.write(require("node:crypto").randomUUID())' 2>/dev/null) || return 1 ;;
+    *) ENGINE_SESSION=$("$FM_SUPERVISION_NODE" -e 'process.stdout.write(require("node:crypto").randomUUID())' 2>/dev/null) || return 1 ;;
   esac
   ENGINE_MODE=new
   ENGINE_TURNS=0
@@ -870,7 +870,7 @@ handle_wake() {  # <reason-lines>
   else
     set --
     case "$first" in heartbeat*) set -- --heartbeat ;; esac
-    if ! scope=$(node "$SCRIPT_DIR/fm-branch-dispatch.mjs" scope "$@" --afk 2>/dev/null); then
+    if ! scope=$("$FM_SUPERVISION_NODE" "$SCRIPT_DIR/fm-branch-dispatch.mjs" scope "$@" --afk 2>/dev/null); then
       HANDLE_WHY="branch eligibility could not be computed"
       return 1
     fi
@@ -948,7 +948,7 @@ handle_wake() {  # <reason-lines>
   rm -f "$WAKE_FILE"
   rc=0
   printf '%s\n' "$reason" \
-    | (umask 077; exec node "$SCRIPT_DIR/fm-branch-dispatch.mjs" wake-prompt "$@" > "$WAKE_FILE" 2>/dev/null) || rc=$?
+    | (umask 077; exec "$FM_SUPERVISION_NODE" "$SCRIPT_DIR/fm-branch-dispatch.mjs" wake-prompt "$@" > "$WAKE_FILE" 2>/dev/null) || rc=$?
   if [ "$rc" -ne 0 ]; then
     [ -z "$readback" ] || rm -f "$readback"
     rm -f "$TURN_FILE" "$mirror"
@@ -1063,7 +1063,7 @@ attended_acceptor() {  # <first-reason-line>
     ATTENDED_WHY="the main session could not be identified"
   elif health_cooling; then
     ATTENDED_WHY="the supervision session is cooling down after engine errors"
-  elif ! offer=$(printf '%s\n' "$1" | node "$SCRIPT_DIR/fm-branch-dispatch.mjs" offer 2>/dev/null); then
+  elif ! offer=$(printf '%s\n' "$1" | "$FM_SUPERVISION_NODE" "$SCRIPT_DIR/fm-branch-dispatch.mjs" offer 2>/dev/null); then
     ATTENDED_WHY="branch eligibility could not be computed"
   elif [ "$(printf '%s\n' "$offer" | sed -n 's/^eligible=//p')" != 1 ]; then
     ATTENDED_WHY="main-only"
@@ -1138,8 +1138,8 @@ while :; do
     if [ -z "$FM_SUPERVISION_ENGINE" ]; then
       exit_to_main "no supervision engine runs here: $FM_SUPERVISION_ENGINE_PROBLEM; this wake is yours"
     fi
-    if ! command -v node >/dev/null 2>&1; then
-      exit_to_main "node is required to compute branch eligibility; this wake is yours"
+    if ! fm_supervision_node_resolve "$CONFIG"; then
+      exit_to_main "$FM_SUPERVISION_NODE_PROBLEM; this wake is yours"
     fi
     if health_cooling; then
       exit_to_main "the away session is paused after repeated engine errors until $(fm_supervision_host_clock "$HEALTH_RETRY"); this wake is yours"

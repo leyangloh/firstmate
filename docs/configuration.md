@@ -317,6 +317,17 @@ On that home, `/afk` launches no away daemon; see [Quiet mode](supervision-host.
 The same gate governs the primary's dialog-mirror hooks (`bin/fm-host-mirror.sh`), which record on a Claude or Cursor primary ([supervision-host.md](supervision-host.md#the-dialog-mirror)).
 Grok's arm command is rendered at session start, so a change to its host mode takes effect at its next session start; the other arm owners check the gate at every arm.
 
+### Node runtime
+
+The supervision host requires Node.js 24.11 or newer because its dispatcher imports the supervision branch's TypeScript owner directly.
+The optional machine-local `config/supervision-node` pins one absolute Node executable path on exactly one line; it is not inherited into secondmate homes.
+An unreadable, missing, malformed, or unsupported explicit pin leaves the wake with main and reports the pin or installed version instead of falling back silently.
+Without a pin, the host selects the first supported executable on its absolute PATH entries, then normal Homebrew/system locations, then a bounded scan of installed nvm runtimes.
+It never installs a runtime or enables an older runtime with compatibility flags.
+After a source update, a newly started ordinary arm loads this selection logic even when the primary retains an old PATH; no primary-session reset is required.
+A host already running this logic checks runtime readiness again at each wake, including changes to its runtime pin.
+`bin/fm-supervision-engine-lib.sh` owns runtime selection, and `tests/fm-supervision-node.test.sh` exercises the real dispatcher without a model turn.
+
 ### Engine selection
 
 `config/supervision-host` may be empty or hold one line `<engine> [<model>]`:

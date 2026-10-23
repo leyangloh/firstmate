@@ -2973,7 +2973,7 @@ test_superseded_host_leaves_the_owner_untouched() {
 }
 
 test_quota_pause_keeps_engine_and_main_idle() {
-  local home
+  local home polls=0
   home=$(make_home quota-pause attended)
   : > "$home/config/claude-quota-pause"
   printf '%s\n' "$home/quota.jsonl" > "$home/config/claude-quota-transcripts"
@@ -2981,6 +2981,16 @@ test_quota_pause_keeps_engine_and_main_idle() {
   start_host "$home"
   wait_until 150 watcher_live "$home" || fail 'quota host never started watcher'
   append_status "$home" 'step one'
+  # The watcher's lock precedes queue admission; wait for this exact wake before
+  # observing two idle seconds, while still detecting a premature engine/main.
+  while ! awk -F '\t' '$3 == "signal" && $4 == "demo.status" {found=1} END {exit !found}' \
+    "$home/state/.wake-queue" 2>/dev/null; do
+    [ "$(engine_calls "$home")" -eq 0 ] || fail 'quota host invoked engine before queue admission'
+    [ ! -e "$home/host.rc" ] || fail 'quota host handed back to main before queue admission'
+    polls=$((polls + 1))
+    [ "$polls" -lt 250 ] || fail 'quota host never admitted its pending status wake'
+    sleep 0.1
+  done
   sleep 2
   [ "$(engine_calls "$home")" -eq 0 ] || fail 'quota host invoked engine'
   [ ! -e "$home/host.rc" ] || fail 'quota host handed back to main'
