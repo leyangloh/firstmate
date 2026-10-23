@@ -1,12 +1,35 @@
 ---
 name: ship-landing
-description: Load when a ship reports a PR or ready branch, when deciding or monitoring landing, and before task cleanup.
+description: Load before choosing a delivery path, when a ship reports a PR or ready branch, when deciding or monitoring landing, and before task cleanup.
 user-invocable: false
 metadata:
   internal: true
 ---
 
 # Ship landing
+
+### Selected delivery path and merge authority
+
+The selected delivery path owns its own rigor.
+When no-mistakes is selected, no-mistakes alone owns review, fixes, tests, documentation, push, PR, and CI; otherwise follow the faster path without adding an independent reviewer.
+Never hold work outside no-mistakes for a manual clean verdict, stack serial manual reviews, or infer authority for one from security, architecture, or risk alone.
+A separate review or audit is allowed only when the captain explicitly requests that deliverable or the authorized task is a knowledge-only review; one named question remains scoped to that question.
+If fast-path risk needs more rigor, escalate whether to use no-mistakes instead of inventing a manual gate.
+The path's worker, automated gates, and captain approval remain authoritative:
+
+- **no-mistakes** runs the full pipeline through a PR, then waits for the configured merge authority.
+- **direct-PR** has the worker push and open a PR without the no-mistakes pipeline, then waits for the configured merge authority.
+- **local-only** has the worker stop with a clean ready branch, then waits for the configured merge authority before firstmate uses the guarded fast-forward merge path.
+
+Delivery mode and `yolo` are orthogonal.
+`yolo` governs merge authority only: with it off, the captain approves every PR merge and every local-only landing; with it on, firstmate merges green, in-scope work itself.
+Never merge a red PR, or one with a required check that has not reported, under either setting unless a current explicit captain instruction names the GitHub check to waive or orders that merge for a GitLab merge request with no head pipeline; `bin/fm-pr-merge.sh`'s header owns the attended-only waiver mechanics and remaining guards.
+Destructive, irreversible, and security-sensitive merges still escalate.
+Without a current explicit captain instruction that states the concrete merge, the green default stands, and standing `yolo` cannot authorize a red merge; `AGENTS.md` section 1 owns when such an instruction overrides a Firstmate-written standing rule within its exact scope.
+Load `ask-user-authority` and `validation-supervision` before deciding or answering any ask-user finding; the implementation worker never answers its own finding.
+Use `bin/fm-pr-merge.sh` for every task PR merge so merge metadata is recorded and an unproved merge is refused instead of reported as landed, and use `bin/fm-merge-local.sh` for approved local-only landing; never call a lower-level merge command around their guards.
+After an autonomous merge, give the captain a one-line full-URL or local-main outcome.
+
 
 For PR-based ship tasks, the ready signal depends on mode: `no-mistakes` reports `done [at=<epoch>]: PR <url> checks green` after CI is green, while `direct-PR` reports `done [at=<epoch>]: PR <url>` after opening the PR, each only for a non-draft PR; a lane that deliberately holds a draft declares a wait instead, and `bin/fm-pr-check.sh` refuses to arm merge monitoring on a draft.
 Run `bin/fm-pr-check.sh <id> <PR url>` with the URL copied from that ready signal or the resolved checks-green `fm-crew-state.sh` line - it records `pr=` and the forge's `pr_head=` when available in the task's meta and arms the watcher's merge poll.

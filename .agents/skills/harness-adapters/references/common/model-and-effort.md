@@ -25,6 +25,16 @@ Polytoken uses its [model-scoped selectable-reference contract](../harness/polyt
 
 ## Harness and provider identity
 
+### Bounded native task-worker subagents
+
+This policy applies only where a task worker already has legitimate native delegation authority; Firstmate supervisors still use durable workers and never bypass the native Agent/Task delegation guard.
+For bounded mechanical work or focused research through a native general-purpose subagent tool that supports Sonnet, explicitly select that tool's verified Sonnet selector rather than inheriting an unspecified model.
+Do not create a custom general-purpose agent merely to obtain that default.
+Explicit captain/model instructions and applicable configured pins win, including Opus or other standing stronger-reasoning preferences for implementation, architecture/design, and security work.
+Uncertainty or a larger blast radius is a reason to retain the required stronger reasoning, not silently broaden the cheap-work category.
+If the permitted tool cannot select Sonnet, report the capability limitation and follow its authorized model-selection path; never silently switch harnesses/providers or globally downgrade agents.
+Effort still follows the precedence and fallback above.
+
 Harness identity is independent of model provider.
 `harness=pi` with `model=xai/grok-*` is Pi using xAI, not standalone Grok Build, and does not require Grok CLI login.
 `harness=cursor` with `model=cursor-grok-4.5-*` is Cursor routing a Grok model, not `harness=grok`.
