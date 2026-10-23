@@ -21,6 +21,14 @@ SPAWN="$ROOT/bin/fm-spawn.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 TMP_ROOT=$(fm_test_tmproot fm-project-capacity)
 DEFER_EXIT=75
+CAPACITY_REAL_TMUX=$(command -v tmux 2>/dev/null || true)
+CAPACITY_SOCKET="fm-capacity-$$"
+export CAPACITY_REAL_TMUX CAPACITY_SOCKET
+cleanup_capacity() {
+  [ -z "$CAPACITY_REAL_TMUX" ] || "$CAPACITY_REAL_TMUX" -L "$CAPACITY_SOCKET" kill-server >/dev/null 2>&1 || true
+  fm_test_cleanup
+}
+trap cleanup_capacity EXIT
 HAVE_TASKS_AXI=0
 command -v tasks-axi >/dev/null 2>&1 && HAVE_TASKS_AXI=1
 
@@ -77,6 +85,9 @@ make_case() {  # <name> [task-id...]
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_FAKE_CALL_LOG"
+case "$*" in
+  *capacity-agents*) exec "$CAPACITY_REAL_TMUX" -L "$CAPACITY_SOCKET" "$@" ;;
+esac
 window_file="$FM_FAKE_CALL_LOG.window"
 case "$*" in
   *"#{pane_current_path}"*)
@@ -649,6 +660,165 @@ SH
   pass "an Orca spawn takes the shared project lock whenever a same-origin clone is capped and defers before creating anything"
 }
 
+test_agents_mode_releases_only_proven_dead_endpoints() {
+  local case_dir home out rc=0 standin
+  [ -n "$CAPACITY_REAL_TMUX" ] || { printf 'skip: tmux not found for agents capacity proof\n'; return; }
+  case_dir=$(make_case agents task-c task-d)
+  home="$case_dir/home"
+  declare_capacity "$home" "project 1"
+  printf 'project agents\n' > "$home/config/project-capacity-mode"
+  "$CAPACITY_REAL_TMUX" -L "$CAPACITY_SOCKET" new-session -d -s capacity-agents -n fm-retained -- /bin/sh || fail "could not start private capacity endpoint"
+  write_live "$home" retained "$case_dir/project"
+  sed -i.bak -e 's/window=firstmate:/window=capacity-agents:/' -e 's/^worktree=.*/worktree=/' "$home/state/retained.meta"
+  rm "$home/state/retained.meta.bak"
+  printf 'done: retained report exists\n' > "$home/state/retained.status"
+  # Publication and launch delivery are protected by this lock, so an agent-free
+  # shell during a concurrent launch still reserves its place.
+  mkdir "$home/state/.spawn-retained.lock"
+  out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "an in-progress spawn's shell did not reserve its place: $out"
+  rmdir "$home/state/.spawn-retained.lock"
+  rc=0
+  out=$(spawn_ship "$case_dir" task-c) || rc=$?
+  expect_code 0 "$rc" "a proven agent-free retained endpoint did not release its place: $out"
+  assert_present "$home/state/retained.meta" "agents accounting removed the retained record"
+  # The newly admitted fake endpoint is authoritatively missing on its backend;
+  # missing is uncertain because the record carries no tmux socket identity.
+  rc=0
+  out=$(spawn_ship "$case_dir" task-d "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "an absent endpoint incorrectly freed the admitted worker's slot: $out"
+  assert_contains "$out" "1 already hold a place (task-c)" "agents occupancy did not distinguish dead from missing"
+  rm "$home/state/task-c.meta"
+  standin=$(fm_agent_standin "$case_dir/standin") || fail "could not create agent process stand-in"
+  ln -s "$standin" "$case_dir/codex"
+  "$CAPACITY_REAL_TMUX" -L "$CAPACITY_SOCKET" new-window -d -t capacity-agents: -n fm-resumed -- "$case_dir/codex" 900 || fail "could not start private live agent"
+  # A second clone of the same origin still belongs to this project identity.
+  git clone --quiet "$(git -C "$case_dir/project" remote get-url origin)" "$case_dir/clone"
+  write_live "$home" resumed "$case_dir/clone" "pr=https://github.com/o/r/pull/7"
+  sed -i.bak 's/window=firstmate:/window=capacity-agents:/' "$home/state/resumed.meta"
+  rm "$home/state/resumed.meta.bak"
+  printf 'done: old handoff\n' > "$home/state/resumed.status"
+  rc=0
+  out=$(spawn_ship "$case_dir" task-d "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "a resumed live PR worker did not occupy its place: $out"
+  assert_contains "$out" "1 already hold a place (resumed)" "same-origin live PR worker was not counted"
+  "$CAPACITY_REAL_TMUX" -L "$CAPACITY_SOCKET" kill-server
+  pass "agents mode preserves retained records and counts live PR workers, missing endpoints, and launch reservations"
+}
+
+test_agents_mode_unknown_backend_and_bad_mode_fail_closed() {
+  local case_dir home out rc=0 mode
+  case_dir=$(make_case agents-unknown task-c)
+  home="$case_dir/home"
+  declare_capacity "$home" "project 1"
+  printf 'project agents\n' > "$home/config/project-capacity-mode"
+  write_live "$home" retained "$case_dir/project" "backend=zellij" "pr=https://github.com/o/r/pull/9"
+  out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "an unverified backend was not kept occupied: $out"
+  for mode in 'project live' 'project agents
+project records'; do
+    printf '%b\n' "$mode" > "$home/config/project-capacity-mode"
+    rc=0
+    out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+    [ "$rc" -ne 0 ] && [ "$rc" -ne "$DEFER_EXIT" ] || fail "an invalid mode declaration was not refused: $out"
+    assert_absent "$home/state/task-c.meta" "an invalid mode published a worker"
+  done
+  printf 'project records\n' > "$home/config/project-capacity-mode"
+  rc=0
+  out=$(spawn_ship "$case_dir" task-c) || rc=$?
+  expect_code 0 "$rc" "explicit records mode did not preserve the legacy PR handoff rule: $out"
+  pass "unknown backends remain occupied, invalid modes refuse, and explicit records mode preserves legacy accounting"
+}
+
+test_capacity_burst_expires_and_invalid_declarations_refuse() {
+  local case_dir home out rc=0 expiry bad
+  case_dir=$(make_case burst task-c)
+  home="$case_dir/home"
+  declare_capacity "$home" "project 1"
+  write_live "$home" retained-a "$case_dir/project"
+  write_live "$home" retained-b "$case_dir/project"
+  expiry=$(($(date +%s) + 3600))
+  printf 'project 3 1\n' > "$home/config/project-capacity-burst"
+  out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "an expired burst displaced the base limit: $out"
+  printf 'other-project 9 %s\n' "$expiry" > "$home/config/project-capacity-burst"
+  rc=0
+  out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "another project's burst changed this project's limit: $out"
+  for bad in 'project 0 9999999999' 'project 3 tomorrow' 'project 3 0001' 'project 3 9999999999999' 'project 3 9999999999\nproject 2 9999999999'; do
+    printf '%b\n' "$bad" > "$home/config/project-capacity-burst"
+    rc=0
+    out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+    [ "$rc" -ne 0 ] && [ "$rc" -ne "$DEFER_EXIT" ] || fail "an invalid burst was not refused: $out"
+    assert_absent "$home/state/task-c.meta" "an invalid burst published a task"
+  done
+  printf 'project 3 %s\n' "$expiry" > "$home/config/project-capacity-burst"
+  rc=0
+  out=$(spawn_ship "$case_dir" task-c) || rc=$?
+  expect_code 0 "$rc" "an unexpired burst did not increase fresh admission capacity: $out"
+  printf 'project 3 1\n' > "$home/config/project-capacity-burst"
+  write_brief "$home" task-d
+  add_item "$home" task-d
+  rc=0
+  out=$(spawn_ship "$case_dir" task-d "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "a subsequent admission did not revert to the base limit: $out"
+  assert_present "$home/state/task-c.meta" "expiry removed an admitted worker"
+  pass "bursts are scoped, validated, expire at admission, and preserve already admitted workers"
+}
+
+test_agents_herdr_structured_absence_and_readonly_validation() {
+  local case_dir home out rc=0
+  case_dir=$(make_case herdr-absence task-c)
+  home="$case_dir/home"
+  declare_capacity "$home" "project 1"
+  printf 'project agents\n' > "$home/config/project-capacity-mode"
+  cat > "$case_dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+state=$(cat "$FM_FAKE_CALL_LOG.herdr-state")
+case "$*" in
+  'pane get w1:p2 --session capacity-herdr')
+    case "$state" in
+      missing) printf '%s\n' '{"error":{"code":"pane_not_found"}}' ;;
+      *) printf '%s\n' '{"error":{"code":"server_not_running"}}' ;;
+    esac
+    exit 1
+    ;;
+  'status --json --session capacity-herdr')
+    case "$state" in
+      stopped) printf '%s\n' '{"server":{"running":false}}' ;;
+      *) printf '%s\n' '{"server":{"running":true}}' ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/herdr"
+  fm_write_meta "$home/state/retained.meta" "window=capacity-herdr:w1:p2"     "endpoint_task_id=retained" "project=$case_dir/project" "kind=scout"     "backend=herdr" "herdr_session=capacity-herdr" "herdr_workspace_id=w1"     "herdr_tab_id=w1:t2" "herdr_pane_id=w1:p2"
+  # The read-only allowance must never relax the destructive/default validator.
+  # shellcheck source=/dev/null
+  . "$ROOT/bin/fm-backend.sh"
+  if fm_backend_validate_task_endpoint "$home/state/retained.meta" retained >/dev/null 2>&1; then
+    fail "default endpoint validation accepted a missing worktree field"
+  fi
+  printf 'unreadable\n' > "$case_dir/calls.log.herdr-state"
+  out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "an unreadable Herdr endpoint freed a place: $out"
+  printf 'stopped\n' > "$case_dir/calls.log.herdr-state"
+  rc=0
+  out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "a stopped Herdr server incorrectly proved its pane gone: $out"
+  printf 'missing\n' > "$case_dir/calls.log.herdr-state"
+  rc=0
+  out=$(spawn_ship "$case_dir" task-c) || rc=$?
+  expect_code 0 "$rc" "structured pane absence in the recorded Herdr session did not free a place: $out"
+  assert_present "$home/state/retained.meta" "read-only accounting removed a legacy record"
+  pass "Herdr structured absence frees a place; stopped/unreadable stays occupied and cleanup validation stays strict"
+}
+
+test_agents_mode_releases_only_proven_dead_endpoints
+test_agents_mode_unknown_backend_and_bad_mode_fail_closed
+test_agents_herdr_structured_absence_and_readonly_validation
+test_capacity_burst_expires_and_invalid_declarations_refuse
 test_undeclared_capacity_keeps_dispatch_uncapped
 test_available_capacity_admits_the_worker
 test_exhausted_capacity_defers_without_leaving_anything_behind

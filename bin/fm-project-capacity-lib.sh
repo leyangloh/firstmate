@@ -35,6 +35,15 @@
 # ship or scout spawn from this machine's homes rather than guessing which limit
 # was meant.
 #
+# Optional temporary limit: config/project-capacity-burst in the same directory
+# has '<project-name> <capacity> <expiry-epoch>' lines. Names and comments follow
+# the capacity file, and capacity has the same positive six-digit constraint.
+# Expiry is a positive Unix epoch in seconds of at most twelve digits. Any
+# duplicate or malformed declaration refuses fresh spawns. Lookup validates
+# every entry, and applies a matching burst only when the project has a base
+# declaration and current time is strictly before expiry. Expiry simply returns
+# future admissions to the base limit; it never interrupts existing workers.
+#
 # Occupancy: a place is held by every task record, in any local Firstmate home on
 # this machine (fm_local_firstmate_state_dirs in bin/fm-wake-lib.sh), that
 #   - is not a secondmate, which is a persistent home rather than a worker,
@@ -45,7 +54,7 @@
 #   - has no recorded PR handoff: the pr= line bin/fm-pr-check.sh records when a
 #     worker's PR is ready, after which the worker waits on review or merge and
 #     no longer uses local resources.
-# A place therefore frees when a PR-based ship records its ready PR, or when any
+# In the default records mode, a place therefore frees when a PR-based ship records its ready PR, or when any
 # task is cleaned up and its record removed. A local-only ship and a scout have
 # no recorded handoff and hold their place until cleanup. A worker that is
 # steered back into work after its PR handoff is not counted again.
@@ -57,6 +66,23 @@
 # A record whose project directory no longer exists cannot be matched and holds
 # no place. Remote homes are never walked, because their workers run on another
 # machine.
+#
+# Optional accounting: config/project-capacity-mode in that same config directory
+# has one '<project-name> <records|agents>' line per project, with the same name,
+# whitespace, and comment rules (the final field is a mode instead of a number).
+# Absent entries use records, preserving the occupancy contract above. Duplicate,
+# malformed, or unreadable mode declarations refuse fresh spawns too.
+# In agents mode PR handoff does not free a place: every matching task counts
+# unless the validated endpoint is positively agent-free or a running Herdr
+# session returns structured proof that its recorded pane is gone.
+# An existing per-task spawn or metadata lock reserves the place through launch
+# delivery. Missing tmux endpoints still count because the metadata does not prove
+# the socket identity; ambiguous, unreadable, unverified, and malformed endpoints
+# also count. Status events and semantic idle are not release evidence.
+# This is a conservative live-agent admission limit, not a resource or job limit:
+# an idle but running agent still counts, background pipelines are not inspected,
+# and steering/relaunching an existing task does not reacquire admission, so later
+# resumptions can exceed the limit. No record, endpoint, or worktree is removed.
 #
 # Race safety: bin/fm-spawn.sh evaluates admission while holding the shared
 # project lock and keeps holding it until the new task record is published, so
@@ -95,15 +121,22 @@ fm_project_capacity_config_dir() {  # <spawning-home> <spawning-config-dir>
 # Sets FM_PROJECT_CAPACITY_FILE to the declaration path, FM_PROJECT_CAPACITY
 # to the project's capacity, or to empty when the project declares none, and
 # FM_PROJECT_CAPACITY_ANY to 1 when the declaration caps any project at all.
+# FM_PROJECT_CAPACITY_BASE keeps the ordinary limit and
+# FM_PROJECT_CAPACITY_BURST_EXPIRES exposes a matching burst's expiry, even when
+# expired. FM_PROJECT_CAPACITY_MODE is records or agents.
 # Returns 1 with FM_PROJECT_CAPACITY_ERROR when the declaration is unreadable.
 fm_project_capacity_lookup() {  # <config-dir> <project-name>
   local name=$2 line lineno=0 pname pcap seen='|'
   FM_PROJECT_CAPACITY_FILE="$1/project-capacity"
   FM_PROJECT_CAPACITY=
   FM_PROJECT_CAPACITY_ANY=
+  FM_PROJECT_CAPACITY_BASE=
+  FM_PROJECT_CAPACITY_BURST_EXPIRES=
   FM_PROJECT_CAPACITY_ERROR=
+  fm_project_capacity_mode_lookup "$1" "$name" || return 1
   if [ ! -e "$FM_PROJECT_CAPACITY_FILE" ] && [ ! -L "$FM_PROJECT_CAPACITY_FILE" ]; then
-    return 0
+    fm_project_capacity_burst_lookup "$1" "$name"
+    return $?
   fi
   if [ ! -f "$FM_PROJECT_CAPACITY_FILE" ] || [ ! -r "$FM_PROJECT_CAPACITY_FILE" ]; then
     FM_PROJECT_CAPACITY_ERROR="$FM_PROJECT_CAPACITY_FILE is not a readable regular file"
@@ -158,7 +191,123 @@ fm_project_capacity_lookup() {  # <config-dir> <project-name>
     [ "$pname" != "$name" ] || FM_PROJECT_CAPACITY=$pcap
   done < "$FM_PROJECT_CAPACITY_FILE"
   [ "$seen" = '|' ] || FM_PROJECT_CAPACITY_ANY=1
-  return 0
+  FM_PROJECT_CAPACITY_BASE=$FM_PROJECT_CAPACITY
+  fm_project_capacity_burst_lookup "$1" "$name"
+}
+
+# Apply a validated, unexpired temporary limit only over a declared base limit.
+# Current time is read once per lookup; there is no timer or running-job action.
+fm_project_capacity_burst_lookup() {  # <config-dir> <project-name>
+  local file="$1/project-capacity-burst" name=$2 line expiry limit project rest seen='|' lineno=0 now
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then return 0; fi
+  if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    FM_PROJECT_CAPACITY_ERROR="$file is not a readable regular file"
+    return 1
+  fi
+  now=$(date +%s) || { FM_PROJECT_CAPACITY_ERROR="current time cannot be read for $file"; return 1; }
+  case "$now" in ''|*[!0-9]*) FM_PROJECT_CAPACITY_ERROR="current time cannot be read for $file"; return 1 ;; esac
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    case "$line" in
+      '' | '#' | '#'[[:space:]]*) continue ;;
+      '#'*) case "${line##*[[:space:]]}" in *[!0-9]*) continue ;; esac ;;
+    esac
+    expiry=${line##*[[:space:]]}
+    rest=${line%"$expiry"}
+    rest=${rest%"${rest##*[![:space:]]}"}
+    limit=${rest##*[[:space:]]}
+    project=${rest%"$limit"}
+    project=${project%"${project##*[![:space:]]}"}
+    case "$limit" in
+      ''|*[!0-9]*|0*) FM_PROJECT_CAPACITY_ERROR="$file line $lineno has an invalid burst limit"; return 1 ;;
+    esac
+    case "$expiry" in
+      ''|*[!0-9]*|0*) FM_PROJECT_CAPACITY_ERROR="$file line $lineno has an invalid expiry epoch"; return 1 ;;
+    esac
+    if [ -z "$project" ] || [ "${#limit}" -gt 6 ] || [ "${#expiry}" -gt 12 ]; then
+      FM_PROJECT_CAPACITY_ERROR="$file line $lineno is not '<project-name> <capacity> <expiry-epoch>' with bounded positive numbers"
+      return 1
+    fi
+    case "$seen" in
+      *"|$project|"*) FM_PROJECT_CAPACITY_ERROR="$file line $lineno names $project a second time"; return 1 ;;
+    esac
+    seen="$seen$project|"
+    if [ "$project" = "$name" ]; then
+      FM_PROJECT_CAPACITY_BURST_EXPIRES=$expiry
+      if [ -n "$FM_PROJECT_CAPACITY_BASE" ] && [ "$now" -lt "$expiry" ]; then
+        FM_PROJECT_CAPACITY=$limit
+        FM_PROJECT_CAPACITY_FILE=$file
+      fi
+    fi
+  done < "$file"
+}
+
+# Read the optional per-project accounting mode, defaulting to records.
+# Like capacity, invalid entries anywhere refuse the whole declaration.
+fm_project_capacity_mode_lookup() {  # <config-dir> <project-name>
+  local file="$1/project-capacity-mode" name=$2 line mode project seen='|' lineno=0
+  FM_PROJECT_CAPACITY_MODE=records
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then return 0; fi
+  if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    FM_PROJECT_CAPACITY_ERROR="$file is not a readable regular file"
+    return 1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    case "$line" in
+      '' | '#' | '#'[[:space:]]*) continue ;;
+      '#'*)
+        case "${line##*[[:space:]]}" in agents|records) ;; *) continue ;; esac
+        ;;
+    esac
+    mode=${line##*[[:space:]]}
+    project=${line%"$mode"}
+    project=${project%"${project##*[![:space:]]}"}
+    case "$mode" in
+      agents|records) ;;
+      *) FM_PROJECT_CAPACITY_ERROR="$file line $lineno has an unknown accounting mode"; return 1 ;;
+    esac
+    if [ -z "$project" ]; then
+      FM_PROJECT_CAPACITY_ERROR="$file line $lineno is not '<project-name> <records|agents>'"
+      return 1
+    fi
+    case "$seen" in
+      *"|$project|"*) FM_PROJECT_CAPACITY_ERROR="$file line $lineno names $project a second time"; return 1 ;;
+    esac
+    seen="$seen$project|"
+    [ "$project" != "$name" ] || FM_PROJECT_CAPACITY_MODE=$mode
+  done < "$file"
+}
+
+# A conservative release proof, delegated to the existing backend classifier.
+# Locks reserve provisional records until launch delivery has completed; even
+# an abandoned lock remains occupied rather than risking a concurrent launch.
+fm_project_capacity_agent_released() {  # <meta> <id> <state>
+  local meta=$1 id=$2 state=$3 lock verdict backend target
+  lock=$(fm_meta_lock_path "$meta") || return 1
+  [ ! -e "$lock" ] && [ ! -L "$lock" ] || return 1
+  lock="$state/.spawn-$id.lock"
+  [ ! -e "$lock" ] && [ ! -L "$lock" ] || return 1
+  fm_backend_validate_task_endpoint "$meta" "$id" endpoint-only >/dev/null 2>&1 || return 1
+  backend=$FM_BACKEND_VALIDATED_BACKEND
+  target=$FM_BACKEND_VALIDATED_TARGET
+  fm_backend_source "$backend" || return 1
+  verdict=$(fm_backend_agent_state "$backend" "$target" 2>/dev/null) || return 1
+  case "$backend:$verdict" in
+    *:dead) return 0 ;;
+    herdr:missing)
+      fm_backend_herdr_parse_target "$target" || return 1
+      [ "$(fm_backend_herdr_server_running_state "$FM_BACKEND_HERDR_SESSION")" = running ] || return 1
+      [ "$(fm_backend_herdr_pane_presence_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")" = dead ]
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 # Count the task records holding a place in one project's capacity.
@@ -200,7 +349,9 @@ fm_project_capacity_occupants() {  # <project-lock> <project-dir> <first-state> 
       }
       kind=$(fm_meta_get "$meta" kind)
       [ "$kind" != secondmate ] || continue
-      [ -z "$(fm_meta_get "$meta" pr)" ] || continue
+      if [ "${FM_PROJECT_CAPACITY_MODE:-records}" = records ]; then
+        [ -z "$(fm_meta_get "$meta" pr)" ] || continue
+      fi
       project=$(fm_meta_get "$meta" project)
       [ -n "$project" ] || continue
       lock=
@@ -219,6 +370,10 @@ fm_project_capacity_occupants() {  # <project-lock> <project-dir> <first-state> 
       fi
       [ -n "$lock" ] && [ "$lock" = "$want" ] || continue
       id=$(basename "$meta" .meta)
+      if [ "${FM_PROJECT_CAPACITY_MODE:-records}" = agents ] &&
+        fm_project_capacity_agent_released "$meta" "$id" "$state"; then
+        continue
+      fi
       label=$id
       [ "$state" = "$first" ] || label="$id in $(dirname "$state")"
       FM_PROJECT_CAPACITY_OCCUPANTS=$((FM_PROJECT_CAPACITY_OCCUPANTS + 1))

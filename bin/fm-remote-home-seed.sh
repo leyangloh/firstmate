@@ -49,6 +49,11 @@ die() { printf 'error: %s\n' "$1" >&2; exit 1; }
 usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 encode() { base64 | tr -d '\n'; }
 safe_id() { case "$1" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac; }
+shell_quote() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
+}
 
 TMP=
 REGISTRY_LOCK=
@@ -156,11 +161,24 @@ REG_EXISTED=0
 # Each rewrite stays its own plain assignment: on stock macOS bash a quoted
 # substitution nested inside a double-quoted argument leaks literal quotes
 # into the replacement text.
+# The optional status ledger leg must also use the remote home's flag and
+# remote code root, never test or execute paths belonging to the parent host.
+PARENT_CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+case "$PARENT_CONFIG" in /*) ;; *) PARENT_CONFIG="$PWD/$PARENT_CONFIG" ;; esac
+PARENT_LEDGER_FLAG=$(shell_quote "$PARENT_CONFIG/fleet-ledger")
+REMOTE_LEDGER_FLAG=$(shell_quote "$REMOTE_HOME/config/fleet-ledger")
+PARENT_LEDGER_CONFIG=$(shell_quote "$PARENT_CONFIG")
+REMOTE_LEDGER_CONFIG=$(shell_quote "$REMOTE_HOME/config")
+PARENT_LEDGER_HELPER=$(shell_quote "$FM_ROOT/bin/fm-fleet-ledger.sh")
+REMOTE_LEDGER_HELPER=$(shell_quote "$REMOTE_ROOT/bin/fm-fleet-ledger.sh")
 PARENT_STATUS="$STATE/$ID.status"
 REMOTE_STATUS="$REMOTE_HOME/state/parent-replies.status"
 PARENT_INBOX="$STATE/$ID.inbox"
 REMOTE_INBOX="$REMOTE_HOME/state/parent-route/$ID.inbox"
 while IFS= read -r line || [ -n "$line" ]; do
+  line=${line//"$PARENT_LEDGER_FLAG"/"$REMOTE_LEDGER_FLAG"}
+  line=${line//"$PARENT_LEDGER_CONFIG"/"$REMOTE_LEDGER_CONFIG"}
+  line=${line//"$PARENT_LEDGER_HELPER"/"$REMOTE_LEDGER_HELPER"}
   line=${line//"$PARENT_STATUS"/"$REMOTE_STATUS"}
   line=${line//"$PARENT_INBOX"/"$REMOTE_INBOX"}
   printf '%s\n' "$line"

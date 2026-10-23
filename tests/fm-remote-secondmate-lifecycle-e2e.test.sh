@@ -799,7 +799,7 @@ pass "seeding carries bitbucket, self-hosted, and scp-like origins through to th
 # Provision and register the remote route from the captain-facing primary.
 out=$(FM_SECONDMATE_CHARTER='Own iOS delivery on the build Mac.' \
   FM_SECONDMATE_SCOPE='iOS implementation and Xcode validation' \
-  remote_env "$ROOT/bin/fm-remote-home-seed.sh" ios remote-mac "$REMOTE_ROOT" "$REMOTE_HOME" alpha)
+  remote_env env FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-remote-home-seed.sh" ios remote-mac "$REMOTE_ROOT" "$REMOTE_HOME" alpha)
 assert_contains "$out" "home=remote-mac:$REMOTE_HOME" "remote seed did not report the host-qualified home"
 assert_grep 'host: remote-mac; root:' "$PARENT/data/secondmates.md" "registry did not record the remote host dimension"
 assert_present "$REMOTE_HOME/.fm-secondmate-home" "remote provisioning did not publish the identity marker"
@@ -817,6 +817,51 @@ if FM_SECONDMATE_CHARTER='Own iOS delivery on the build Mac.' \
 fi
 assert_grep "home: $REMOTE_HOME" "$PARENT/data/secondmates.md" "refused remote reassignment changed the durable route"
 pass "remote seed registers the route and provisions the whole home and project clone on that host"
+
+# Execute the emitted instruction, including its optional ledger leg, with
+# different parent/remote flags so a foreign config cannot look host-local.
+charter_status_command=$(awk '/^   `echo / { sub(/^   `/, ""); sub(/`$/, ""); print; exit }' "$REMOTE_HOME/data/charter.md")
+[ -n "$charter_status_command" ] || fail "remote charter emitted no executable status instruction"
+charter_status_command=${charter_status_command//\{state\}/done}
+charter_status_command=${charter_status_command//<epoch>/123}
+charter_status_command=${charter_status_command//\{one short line\}/generated remote report}
+cat > "$TMP_ROOT/trace-charter-helper.sh" <<SH
+trace_charter_helper() {
+  case "\$0" in
+    '$ROOT/bin/fm-fleet-ledger.sh') printf 'foreign helper\n' >> '$TMP_ROOT/foreign-helper.log'; trap - DEBUG ;;
+    '$REMOTE_ROOT/bin/fm-fleet-ledger.sh') printf 'remote helper\n' >> '$TMP_ROOT/remote-helper.log'; trap - DEBUG ;;
+  esac
+}
+trap trace_charter_helper DEBUG
+SH
+touch "$PARENT/config/fleet-ledger"
+rm -f "$REMOTE_HOME/config/fleet-ledger"
+BASH_ENV="$TMP_ROOT/trace-charter-helper.sh" /bin/bash -c "$charter_status_command" \
+  || fail "generated remote status command failed under stock Bash"
+assert_absent "$TMP_ROOT/foreign-helper.log" "remote instruction executed the parent's helper"
+assert_absent "$REMOTE_HOME/state/fleet-ledger.jsonl" "parent flag enabled the remote ledger"
+touch "$REMOTE_HOME/config/fleet-ledger"
+rm -f "$PARENT/config/fleet-ledger"
+BASH_ENV="$TMP_ROOT/trace-charter-helper.sh" bash -c "$charter_status_command" \
+  || fail "generated remote status command failed with its local ledger enabled"
+assert_grep 'remote helper' "$TMP_ROOT/remote-helper.log" "generated remote status command did not execute the remote helper"
+assert_absent "$TMP_ROOT/foreign-helper.log" "remote instruction executed the parent's helper with its remote ledger enabled"
+jq -e 'select(.event == "task.status" and .task == "parent-replies" and .state == "done" and .text == " generated remote report")' \
+  "$REMOTE_HOME/state/fleet-ledger.jsonl" >/dev/null \
+  || fail "generated remote instruction did not record its report through the remote helper and config"
+[ "$(cat "$REMOTE_HOME/state/parent-replies.status")" = \
+  $'done [at=123]: generated remote report\ndone [at=123]: generated remote report' ] \
+  || fail "generated remote instruction did not append exactly to the host-local parent channel"
+mv "$REMOTE_ROOT/bin/fm-fleet-ledger.sh" "$TMP_ROOT/remote-ledger-helper"
+fallback_rc=0
+/bin/bash -c "$charter_status_command" || fallback_rc=$?
+mv "$TMP_ROOT/remote-ledger-helper" "$REMOTE_ROOT/bin/fm-fleet-ledger.sh"
+[ "$fallback_rc" -eq 0 ] || fail "an older remote install without the optional ledger helper lost its plain append"
+[ "$(wc -l < "$REMOTE_HOME/state/parent-replies.status" | tr -d ' ')" -eq 3 ] \
+  || fail "the missing optional helper prevented the third parent report"
+rm -f "$REMOTE_HOME/config/fleet-ledger" "$REMOTE_HOME/state/fleet-ledger.jsonl" \
+  "$REMOTE_HOME/state/.parent-replies.fleet-ledger-offset" "$REMOTE_HOME/state/parent-replies.status"
+pass "generated remote report executes with stock Bash and host-local optional ledger"
 
 PROTOCOL_HOME="$TMP_ROOT/protocol-home"
 mkdir -p "$PROTOCOL_HOME/config" "$PROTOCOL_HOME/data" "$PROTOCOL_HOME/state"
@@ -990,13 +1035,12 @@ EOF
 FM_FAKE_SSH_MODE=inherit-block remote_env "$ROOT/bin/fm-spawn.sh" ios --secondmate \
   > "$TMP_ROOT/spawn-concurrent.out" 2>&1 &
 spawn_concurrent=$!
-spawn_inherit_wait=0
+spawn_inherit_deadline=$((SECONDS + 180))
 # Earlier inherited files traverse the worker before captain-shared.md, so give
-# a loaded portable runner 30 seconds to reach this deliberately blocked write.
+# a loaded portable runner a bounded 180s rendezvous budget for the serial jobs.
 while [ ! -f "$TMP_ROOT/inherit.entered" ]; do
   kill -0 "$spawn_concurrent" 2>/dev/null || fail "remote spawn exited before its blocked inheritance write"
-  spawn_inherit_wait=$((spawn_inherit_wait + 1))
-  [ "$spawn_inherit_wait" -le 1500 ] || fail "remote spawn never reached its blocked inheritance write"
+  [ "$SECONDS" -lt "$spawn_inherit_deadline" ] || fail "remote spawn never reached its blocked inheritance write within 180s"
   sleep 0.02
 done
 cat > "$PARENT/data/captain-shared.md" <<'EOF'
@@ -1048,14 +1092,17 @@ CORR=$(newest_remote_inbox_corr)
 assert_grep "FM_PENDING_REPLY_EXISTING_CORR=$CORR" "$TMP_ROOT/send.err" "ambiguous remote send did not print its correlation-reusing command"
 phase=$(grep '^phase=' "$PARENT/state/pending-replies/$CORR" | cut -d= -f2-)
 [ "$phase" = delivery_unknown ] || fail "ambiguous remote send did not preserve its pending expectation"
-printf 'done [corr=%s]: remote build passed\n' "$CORR" >> "$REMOTE_HOME/state/parent-replies.status"
+reply_epoch=$(date +%s)
+charter_reply_command=${charter_status_command//at=123/at=$reply_epoch}
+charter_reply_command=${charter_reply_command//generated remote report/remote build passed corr=$CORR}
+bash -c "$charter_reply_command" || fail "generated charter reply command failed"
 SID='remote-reply-ios'
 await_reply_result "$PARENT/state/procevent-inbox/$SID.1.result" \
   || fail "remote reply source did not capture the correlated answer"
 RESULT="$PARENT/state/procevent-inbox/$SID.1.result"
 remote_env "$ROOT/bin/fm-procevent-remote-reply.sh" handle ios 1 "$RESULT" >/dev/null \
   || fail "remote reply ingest failed"
-assert_grep "done [corr=$CORR]: remote build passed" "$PARENT/state/ios.status" "correlated remote reply did not reach the parent status channel"
+assert_grep "done [at=$reply_epoch]: remote build passed corr=$CORR" "$PARENT/state/ios.status" "correlated generated remote reply did not reach the parent status channel"
 phase=$(grep '^phase=' "$PARENT/state/pending-replies/$CORR" | cut -d= -f2-)
 [ "$phase" = resolved ] || fail "correlated remote reply did not resolve the parent expectation"
 pass "marked send and routed reply complete through the existing parent correlation owner"
@@ -1101,13 +1148,11 @@ EOF
 FM_FAKE_SSH_MODE=inherit-block remote_env "$ROOT/bin/fm-config-push.sh" \
   > "$TMP_ROOT/config-concurrent-first.out" 2>&1 &
 config_first=$!
-inherit_wait=0
+inherit_deadline=$((SECONDS + 180))
 while [ ! -f "$TMP_ROOT/inherit.entered" ]; do
   kill -0 "$config_first" 2>/dev/null || fail "first inheritance transaction exited before its blocked write"
-  inherit_wait=$((inherit_wait + 1))
-  # Match the earlier spawn/inheritance wait: a loaded portable runner can
-  # spend several seconds in the remote entrypoint before reaching this write.
-  [ "$inherit_wait" -le 1500 ] || fail "first inheritance transaction never reached its blocked write"
+  # Match the earlier serial spawn/inheritance rendezvous budget.
+  [ "$SECONDS" -lt "$inherit_deadline" ] || fail "first inheritance transaction never reached its blocked write within 180s"
   sleep 0.02
 done
 cat > "$PARENT/data/captain-shared.md" <<'EOF'
@@ -1309,14 +1354,15 @@ FM_STATE_OVERRIDE="$WATCH_STATE" FM_SECONDMATE_LIVENESS_SECS=1 FM_POLL=1 \
   remote_env exec "$ROOT/bin/fm-watch.sh" \
   > "$TMP_ROOT/watch-liveness.out" 2> "$TMP_ROOT/watch-liveness.err" &
 watch_pid=$!
-watch_wait=0
-while kill -0 "$watch_pid" 2>/dev/null && [ "$watch_wait" -lt 1500 ]; do
+# Relaunch includes the production-bounded 120s spawn and its readiness probe.
+# Keep a wall-clock deadline with headroom rather than a 30s poll count.
+watch_deadline=$((SECONDS + 180))
+while kill -0 "$watch_pid" 2>/dev/null && [ "$SECONDS" -lt "$watch_deadline" ]; do
   sleep 0.02
-  watch_wait=$((watch_wait + 1))
 done
 if kill -0 "$watch_pid" 2>/dev/null; then
   kill "$watch_pid" 2>/dev/null || true
-  fail "the watcher did not exit on its auto-relaunch wake within the bound: $(cat "$TMP_ROOT/watch-liveness.out" "$TMP_ROOT/watch-liveness.err" 2>/dev/null)"
+  fail "the watcher did not exit on its auto-relaunch wake within 180s: $(cat "$TMP_ROOT/watch-liveness.out" "$TMP_ROOT/watch-liveness.err" 2>/dev/null)"
 fi
 wait "$watch_pid" \
   || fail "the liveness watcher leg exited non-zero: $(cat "$TMP_ROOT/watch-liveness.err")"
@@ -1578,13 +1624,12 @@ rm -f "$TMUX_STATE" "$TMP_ROOT/launch.entered" "$TMP_ROOT/launch.release"
 FM_FAKE_SSH_MODE=launch-block remote_env "$ROOT/bin/fm-spawn.sh" ios --secondmate \
   > "$TMP_ROOT/spawn-retirement.out" 2>&1 &
 spawn_retirement_pid=$!
-launch_wait=0
+launch_deadline=$((SECONDS + 180))
 # The respawn performs readiness and inheritance jobs before launch, so allow
-# the same 30-second loaded-runner bound as the earlier blocked worker path.
+# the same 180s rendezvous budget as the earlier serial worker path.
 while [ ! -f "$TMP_ROOT/launch.entered" ]; do
   kill -0 "$spawn_retirement_pid" 2>/dev/null || fail "remote respawn exited before its blocked launch"
-  launch_wait=$((launch_wait + 1))
-  [ "$launch_wait" -le 1500 ] || fail "remote respawn never reached its blocked launch"
+  [ "$SECONDS" -lt "$launch_deadline" ] || fail "remote respawn never reached its blocked launch within 180s"
   sleep 0.02
 done
 FM_FAKE_SSH_MODE=retire-lost-slot remote_env "$ROOT/bin/fm-teardown.sh" ios \

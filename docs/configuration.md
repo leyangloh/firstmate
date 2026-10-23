@@ -1246,7 +1246,29 @@ The declaration is matched by the spawning clone's directory name, so clones of 
 A clone of that origin under a different directory name finds no declaration and is not capped, though its workers are still counted as holders for a same-origin clone that is capped.
 When every place is held, `bin/fm-spawn.sh` launches nothing, creates no record, leaves the backlog item queued, prints one `deferred:` line naming the holders, and exits 75, so Firstmate dispatches the item again once a place frees.
 A malformed or unreadable file refuses every fresh ship or scout spawn until it is fixed, rather than guessing the intended limit, and so does a local home's state directory or task record that cannot be read while counting a capped project's holders.
-Firstmate cannot see which part of a worker's life uses the resource, so the number bounds whole workers from launch to handoff, and the tightest resource every worker needs should decide it.
+For an authorized temporary burst, keep the ordinary limit in `config/project-capacity` and add `<project-name> <capacity> <expiry-epoch>` to `config/project-capacity-burst` in the same root home.
+The expiry is a positive Unix epoch in seconds of at most twelve digits; capacity uses the same positive six-digit constraint as the base declaration.
+The burst file follows the same project-name and comment rules; duplicate, malformed, or unreadable declarations refuse fresh spawns, including expired malformed entries.
+An unexpired matching burst overrides a declared base limit only until the next admission at or after expiry, which uses the ordinary limit again.
+A burst without a base declaration has no effect, and expiry never interrupts admitted workers or changes retained task records.
+The default accounting mode is `records`, which bounds retained workers from launch to handoff rather than measuring individual resource use.
+To opt a project into conservative live-agent admission, add its name and `agents` to the optional `config/project-capacity-mode` in the same root home:
+
+```text
+my-project agents
+```
+
+This file uses the same project-name and comment rules, with `records` or `agents` as the last field instead of a capacity number; absent project entries use `records`.
+Duplicate, unknown, malformed, or unreadable mode declarations refuse fresh spawns until corrected.
+In `agents` mode a PR handoff still occupies a place when its agent remains running, including a worker resumed after handoff.
+An endpoint releases its place only when validated for read-only liveness and positively identified as agent-free, or when a running recorded Herdr session returns structured proof that its pane is gone.
+Read-only liveness does not require the worktree field that destructive endpoint validation requires.
+A task whose spawn or metadata lock still exists keeps its reservation through launch delivery.
+An idle but running agent, a missing tmux endpoint, a stopped or unreachable Herdr server, an unsupported backend classifier, and any uncertain endpoint remain occupied; old `done` events never release a place.
+The current recovery-grade classifiers are tmux and Herdr; Zellij, Orca, and cmux remain occupied because their agent classifiers are unverified.
+This mode preserves task records, reports, worktrees, and endpoints.
+It bounds fresh agent admission rather than background pipelines or other machine resources, and steering or relaunching existing tasks can exceed the limit because those actions do not acquire another place.
+Audit actual holders before reducing a historical capacity that compensated for retained records, and keep separate limits for expensive background jobs.
 [`bin/fm-project-capacity-lib.sh`](../bin/fm-project-capacity-lib.sh) owns the file format, what holds a place, and why concurrent spawns cannot both take the last one.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)

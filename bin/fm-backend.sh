@@ -389,6 +389,9 @@ fm_backend_tmux_resolve_meta_window() {  # <meta-file> <recorded-window>
 # valid only when their window name itself is exactly fm-<task-id>.
 # On success, sets FM_BACKEND_VALIDATED_BACKEND and
 # FM_BACKEND_VALIDATED_TARGET. On failure, prints one refusal and returns 1.
+# Optional endpoint-only validation is for read-only liveness: it omits the
+# worktree requirement while preserving every task/backend/target identity check.
+# Destructive callers must use the default cleanup validation.
 fm_backend_meta_exact_value() {  # <meta-file> <key>
   local meta=$1 key=$2 count value
   count=$(grep -c "^$key=" "$meta" 2>/dev/null || true)
@@ -423,11 +426,15 @@ fm_backend_orca_worktree_id_valid() {  # <value>
   esac
 }
 
-fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
-  local meta=$1 id=$2 backend_count backend window worktree project binding_count binding
+fm_backend_validate_task_endpoint() {  # <meta-file> <task-id> [cleanup|endpoint-only]
+  local meta=$1 id=$2 validation=${3:-cleanup} backend_count backend window worktree='' project binding_count binding
   local session pane recorded_session workspace tab terminal worktree_id surface
   FM_BACKEND_VALIDATED_BACKEND=
   FM_BACKEND_VALIDATED_TARGET=
+  case "$validation" in
+    cleanup|endpoint-only) ;;
+    *) echo "REFUSED: unknown endpoint validation mode '$validation'." >&2; return 1 ;;
+  esac
   [ -f "$meta" ] && [ ! -L "$meta" ] || {
     echo "REFUSED: task $id has no regular endpoint metadata at $meta; preserving task state." >&2
     return 1
@@ -440,10 +447,12 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
     echo "REFUSED: task $id has a missing, empty, or ambiguous window endpoint; preserving task state." >&2
     return 1
   }
-  worktree=$(fm_backend_meta_exact_value "$meta" worktree) || {
-    echo "REFUSED: task $id has a missing, empty, or ambiguous worktree identity; preserving task state." >&2
-    return 1
-  }
+  if [ "$validation" = cleanup ]; then
+    worktree=$(fm_backend_meta_exact_value "$meta" worktree) || {
+      echo "REFUSED: task $id has a missing, empty, or ambiguous worktree identity; preserving task state." >&2
+      return 1
+    }
+  fi
   project=$(fm_backend_meta_exact_value "$meta" project) || {
     echo "REFUSED: task $id has a missing, empty, or ambiguous project identity; preserving task state." >&2
     return 1
