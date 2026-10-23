@@ -83,6 +83,11 @@ if [ "$mode" = hang ]; then
   sleep "$FM_TEST_STUB_MAX_BLOCK_SECONDS"
   exit 0
 fi
+if [ "$mode" = quota ]; then
+  jq --argjson reset "$(( $(date +%s) + 3600 ))" '.quotaLimits.resetsAt=$reset | .apiErrorParams.rate_limit_info.resetsAt=$reset' \
+    "$FM_REPO/tests/fixtures/claude-quota/rejected.jsonl" | jq -c . > "$FM_HOME/quota.jsonl"
+  exit 1
+fi
 drain=$("$FM_REPO/bin/fm-wake-drain.sh" 2>&1)
 printf '%s\n' "$drain" > "$FM_HOME/engine-drain.$n"
 ack=$(printf '%s\n' "$drain" | sed -n 's/^WAKE_ACK_REQUIRED: after handling completes run bin\/fm-wake-drain.sh //p' | tail -1)
@@ -2967,6 +2972,50 @@ test_superseded_host_leaves_the_owner_untouched() {
   pass "host: a host under a superseded auto-arm generation stands down without touching the owner"
 }
 
+test_quota_pause_keeps_engine_and_main_idle() {
+  local home
+  home=$(make_home quota-pause attended)
+  : > "$home/config/claude-quota-pause"
+  printf '%s\n' "$home/quota.jsonl" > "$home/config/claude-quota-transcripts"
+  printf '{"isApiErrorMessage":true,"apiError":"usage_limit_reached","quotaLimits":{"status":"rejected","rateLimitType":"five_hour","resetsAt":%s}}\n' "$(( $(date +%s) + 3600 ))" > "$home/quota.jsonl"
+  start_host "$home"
+  wait_until 150 watcher_live "$home" || fail 'quota host never started watcher'
+  append_status "$home" 'step one'
+  sleep 2
+  [ "$(engine_calls "$home")" -eq 0 ] || fail 'quota host invoked engine'
+  [ ! -e "$home/host.rc" ] || fail 'quota host handed back to main'
+  assert_grep 'demo.status' "$home/state/.wake-queue" 'quota host consumed pending rows'
+  rm "$home/config/claude-quota-pause"
+  wait_until 250 handled_at_least "$home" 1 || fail "quota host did not resume after flag removal: $(cat "$home/host.out" "$home/state/.supervision-host.log" "$home/claude.err" 2>/dev/null)"
+  stop_home_processes "$home"
+  pass 'host: quota pause keeps engine and main idle with pending rows intact'
+}
+
+test_quota_engine_rejection_does_not_fall_back_or_trip_latch() {
+  local home
+  home=$(make_home quota-error attended)
+  : > "$home/config/claude-quota-pause"
+  printf '%s\n' "$home/quota.jsonl" > "$home/config/claude-quota-transcripts"
+  echo quota > "$home/stub-mode"
+  start_host "$home"
+  wait_until 150 watcher_live "$home" || fail 'quota rejection host never started watcher'
+  append_status "$home" 'step one'
+  wait_until 250 test -s "$home/quota.jsonl" || fail "quota engine never recorded rejection: $(cat "$home/host.out" "$home/state/.supervision-host.log" "$home/claude.err" 2>/dev/null)"
+  sleep 2
+  [ "$(engine_calls "$home")" -eq 1 ] || fail 'quota engine was retried'
+  [ ! -e "$home/host.rc" ] || fail 'quota engine rejection fell back to main'
+  assert_grep 'demo.status' "$home/state/.wake-queue" 'rejection consumed pending rows'
+  assert_no_grep 'errors=1' "$home/state/.supervision-host-health" 'quota rejection damaged health latch'
+  rm "$home/config/claude-quota-pause"
+  wait_until 250 host_exited "$home" || fail 'quota handback did not resume after opt-out'
+  assert_grep 'demo.status' "$home/state/.wake-queue" 'resumed handback consumed pending rows'
+  stop_home_processes "$home"
+  pass 'host: actual rejection schema pauses fallback without consuming rows or charging engine latch'
+}
+
+test_quota_engine_rejection_does_not_fall_back_or_trip_latch
+
+test_quota_pause_keeps_engine_and_main_idle
 test_claude_stop_hook_restores_handoff_when_successor_closed_before_exit_to_main
 test_claude_stop_hook_restores_handoff_when_successor_closed_mid_engine_turn
 test_claude_stop_hook_notifies_when_closed_successor_downtime_restore_fails

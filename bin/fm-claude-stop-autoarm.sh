@@ -256,6 +256,23 @@ fi
 MY_GEN=$FM_AUTOARM_MY_GEN
 [ -n "$MY_GEN" ] || exit 0
 
+# Optional quota evidence is local and tokenless. Preserve the generation and
+# pending wake until its reset; a replacement owner or AFK transition cancels.
+# shellcheck disable=SC2329 # Invoked by the quota waiter callback.
+quota_owner() {
+  fm_autoarm_still_owner "$STATE" "$MY_GEN" && fm_session_lock_owned_by_self "$STATE" \
+    && [ ! -e "$STATE/.afk" ] && need_supervision
+}
+quota_wait() {
+  FM_CLAUDE_QUOTA_WAITED=0
+  [ -f "$CONFIG/claude-quota-pause" ] || return 0
+  # shellcheck source=bin/fm-claude-quota-lib.sh
+  . "$SCRIPT_DIR/fm-claude-quota-lib.sh"
+  FM_CLAUDE_QUOTA_TRANSCRIPT=$(printf '%s' "$PAYLOAD" | jq -r '.transcript_path // empty' 2>/dev/null)
+  export FM_CLAUDE_QUOTA_TRANSCRIPT
+  fm_claude_quota_wait quota_owner
+}
+
 # Commit <outcome> (optionally with the once-per-episode notice marker) for
 # this generation. Success means this generation's translation WINS and the
 # caller exits 2 unconditionally. Markerless outcomes commit with the owned
@@ -265,6 +282,7 @@ MY_GEN=$FM_AUTOARM_MY_GEN
 # even an already-printed banner is never delivered by a losing generation.
 autoarm_commit() {  # <outcome> [marker-file]
   local outcome=$1 marker=${2:-} session_pid recovery
+  quota_wait || return 2
   if [ "$outcome" = rewake ]; then
     fm_session_lock_owned_by_self "$STATE" || return 2
     session_pid=$(sed -n '1p' "$STATE/.lock" 2>/dev/null || true)
@@ -305,6 +323,12 @@ handle_autoarm_signal() {
     wait "$ARM_PID" 2>/dev/null || true
   fi
   [ -z "${OUT:-}" ] || rm -f "$OUT" 2>/dev/null || true
+  # Cancellation during a quota wait must not become another model wake.
+  if [ "${FM_CLAUDE_QUOTA_WAITED:-0}" = 1 ] \
+    || { command -v fm_claude_quota_reset >/dev/null 2>&1 && fm_claude_quota_reset; }; then
+    autoarm_record clean
+    exit 0
+  fi
   if [ -e "$FAILURE_ALARM" ]; then
     autoarm_record failed-suppressed
     exit 0
@@ -414,6 +438,7 @@ while [ "$attempt" -lt "$AUTOARM_ATTEMPTS" ]; do
     [ -z "$OUT" ] || rm -f "$OUT" 2>/dev/null || true
     exit 0
   fi
+  quota_wait || { autoarm_record clean; exit 0; }
   attempt=$((attempt + 1))
   OUT=$(mktemp "$STATE/.claude-autoarm-output.XXXXXX") || OUT=
   if [ "$HOST_MODE" -eq 1 ]; then
@@ -470,6 +495,8 @@ while [ "$attempt" -lt "$AUTOARM_ATTEMPTS" ]; do
   [ -z "$OUT" ] || rm -f "$OUT" 2>/dev/null || true
   OUT=
 done
+
+quota_wait || { autoarm_record clean; [ -z "$OUT" ] || rm -f "$OUT"; exit 0; }
 
 # The need may have vanished mid-cycle (fleet torn down, X opted out): nothing
 # left to supervise, so close quietly instead of waking the model.

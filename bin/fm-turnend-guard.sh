@@ -195,6 +195,15 @@ fi
 # so this exempts them while guarding every real secondmate home.
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 
+# A structurally proven quota rejection lets Stop finish; its async hook owns
+# the tokenless wait. Do not spend another turn trying to repair exhaustion.
+if [ "$CLAUDE_MODE" -eq 1 ] && [ -f "$CONFIG/claude-quota-pause" ]; then
+  # shellcheck source=bin/fm-claude-quota-lib.sh
+  . "$SCRIPT_DIR/fm-claude-quota-lib.sh"
+  FM_CLAUDE_QUOTA_TRANSCRIPT=$(printf '%s' "$PAYLOAD" | jq -r '.transcript_path // empty' 2>/dev/null)
+  fm_claude_quota_reset && exit 0
+fi
+
 # --- the actual predicate ----------------------------------------------------
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"

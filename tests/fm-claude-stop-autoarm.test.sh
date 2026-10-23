@@ -39,6 +39,7 @@ install_autoarm_scripts() {
   cp "$ROOT/bin/fm-classify-lib.sh" "$dir/bin/fm-classify-lib.sh"
   cp "$ROOT/bin/fm-timeout-lib.sh" "$dir/bin/fm-timeout-lib.sh"
   cp "$ROOT/bin/fm-supervision-engine-lib.sh" "$dir/bin/fm-supervision-engine-lib.sh"
+  cp "$ROOT/bin/fm-claude-quota-lib.sh" "$ROOT/bin/fm-claude-quota.mjs" "$dir/bin/"
   chmod +x "$dir/bin/fm-claude-stop-autoarm.sh" "$dir/bin/fm-lock.sh" "$dir/bin/fm-afk-contract.sh"
 }
 
@@ -1985,6 +1986,112 @@ test_fm_lock_status_still_works_with_shared_lib() {
   assert_contains "$out" "lock: free" "fm-lock.sh status must keep working after the session-lock lib extraction"
   pass "fm-lock: shared session-lock lib preserves the status path"
 }
+
+test_quota_wait_preserves_generation_and_resumes() {
+  local dir pid reset rc
+  dir=$(make_primary_dir "$TMP_ROOT/quota-resume")
+  : > "$dir/state/task.meta"
+  : > "$dir/config/claude-quota-pause"
+  write_arm_fixture "$dir" actionable
+  reset=$(( $(date +%s) + 5 ))
+  printf '{"isApiErrorMessage":true,"apiError":"usage_limit_reached","quotaLimits":{"status":"rejected","rateLimitType":"five_hour","resetsAt":%s}}\n' "$reset" > "$dir/transcript.jsonl"
+  run_autoarm "$dir" "{\"session_id\":\"sess-autoarm\",\"transcript_path\":\"$dir/transcript.jsonl\"}" > "$dir/out" 2>&1 &
+  pid=$!
+  sleep 2
+  kill -0 "$pid" 2>/dev/null || fail 'quota wait exited early'
+  [ ! -e "$dir/state/arm-ran" ] || fail 'quota wait spent a watcher cycle before reset'
+  [ "$(epoch_outcome "$dir")" = arming ] || fail 'quota wait released its generation'
+  rc=0; wait "$pid" || rc=$?
+  expect_code 2 "$rc" 'reset should deliver the pending action'
+  assert_grep 'firstmate watcher wake' "$dir/out" 'reset did not rewake'
+  pass 'auto-arm: quota pause retains generation and resumes only after reset'
+}
+
+test_quota_wait_lost_owner_is_silent() {
+  local dir pid rc
+  dir=$(make_primary_dir "$TMP_ROOT/quota-lost-owner")
+  : > "$dir/state/task.meta"
+  : > "$dir/config/claude-quota-pause"
+  write_arm_fixture "$dir" actionable
+  printf '{"isApiErrorMessage":true,"apiError":"usage_limit_reached","quotaLimits":{"status":"rejected","rateLimitType":"five_hour","resetsAt":%s}}\n' "$(( $(date +%s) + 3600 ))" > "$dir/transcript.jsonl"
+  run_autoarm "$dir" "{\"session_id\":\"sess-autoarm\",\"transcript_path\":\"$dir/transcript.jsonl\"}" > "$dir/out" 2>&1 &
+  pid=$!
+  sleep 2
+  printf '%s\n' "$$" > "$dir/state/.lock"
+  rc=0; wait "$pid" || rc=$?
+  expect_code 0 "$rc" 'ownership loss must stop silently'
+  [ ! -e "$dir/state/arm-ran" ] || fail 'lost quota waiter armed'
+  assert_no_grep 'firstmate watcher wake' "$dir/out" 'lost quota waiter rewoke'
+  pass 'auto-arm: quota waiter stops silently on session ownership loss'
+}
+
+test_quota_guard_allows_stop_without_touching_queue() {
+  local dir payload out rc before
+  dir=$(make_primary_dir "$TMP_ROOT/quota-guard")
+  cp "$ROOT/bin/fm-turnend-guard.sh" "$dir/bin/"
+  : > "$dir/config/claude-quota-pause"
+  : > "$dir/state/task.meta"
+  printf 'pending quota regression row\n' > "$dir/state/.wake-queue"
+  before=$(cat "$dir/state/.wake-queue")
+  jq --argjson reset "$(( $(date +%s) + 3600 ))" '.quotaLimits.resetsAt=$reset | .apiErrorParams.rate_limit_info.resetsAt=$reset' \
+    "$ROOT/tests/fixtures/claude-quota/rejected.jsonl" | jq -c . > "$dir/transcript.jsonl"
+  payload="{\"session_id\":\"sess-autoarm\",\"transcript_path\":\"$dir/transcript.jsonl\"}"
+  rc=0
+  out=$(printf '%s\n' "$payload" | FM_HOME="$dir" "$dir/bin/fm-turnend-guard.sh" --claude 2>&1) || rc=$?
+  expect_code 0 "$rc" 'quota guard must allow Stop without another model turn'
+  [ -z "$out" ] || fail "quota guard emitted a continuation: $out"
+  [ "$(cat "$dir/state/.wake-queue")" = "$before" ] || fail 'quota guard changed pending queue'
+  pass 'guard: real rejection schema allows Stop and preserves queued rows'
+}
+
+test_host_quota_crash_waits_and_signal_stays_silent() {
+  local dir pid owner i rc
+  dir=$(make_primary_dir "$TMP_ROOT/quota-host-crash")
+  rm "$dir/config/supervision-host-off"
+  : > "$dir/config/claude-quota-pause"
+  : > "$dir/state/task.meta"
+  printf 'pending quota row\n' > "$dir/state/.wake-queue"
+  cat > "$dir/bin/fm-supervision-host.sh" <<'SH'
+#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FM_ROOT=$FM_HOME
+STATE="$FM_HOME/state"
+CONFIG="$FM_HOME/config"
+. "$SCRIPT_DIR/fm-claude-quota-lib.sh"
+printf 'call\n' >> "$STATE/host-ran"
+FM_CLAUDE_QUOTA_TRANSCRIPT="$STATE/engine.jsonl"
+printf '{"isApiErrorMessage":true,"apiError":"usage_limit_reached","quotaLimits":{"status":"rejected","rateLimitType":"five_hour","resetsAt":%s}}\n' "$(( $(date +%s) + 3600 ))" > "$FM_CLAUDE_QUOTA_TRANSCRIPT"
+fm_claude_quota_reset || exit 9
+rm "$FM_CLAUDE_QUOTA_TRANSCRIPT"
+# Simulate a host dying without emitting a close after proving the reset.
+exit 143
+SH
+  chmod +x "$dir/bin/fm-supervision-host.sh"
+  run_autoarm "$dir" > "$dir/out" 2>&1 &
+  pid=$!
+  for i in $(seq 1 100); do
+    [ -s "$dir/state/.claude-quota-reset" ] && break
+    sleep 0.1
+  done
+  [ -s "$dir/state/.claude-quota-reset" ] || fail 'child host failed to publish quota evidence'
+  sleep 2
+  [ "$(wc -l < "$dir/state/host-ran" | tr -d ' ')" = 1 ] || fail 'parent relaunched host after quota crash'
+  kill -0 "$pid" 2>/dev/null || fail 'parent rewoke main after quota crash'
+  owner=$(epoch_field "$dir" owner_pid)
+  kill -TERM "$owner"
+  rc=0; wait "$pid" || rc=$?
+  expect_code 0 "$rc" 'quota cancellation must not translate into failure rewake'
+  assert_no_grep 'INTERRUPTED' "$dir/out" 'quota cancellation emitted failure notice'
+  [ "$(cat "$dir/state/.wake-queue")" = 'pending quota row' ] || fail 'quota crash/cancellation changed pending queue'
+  pass 'auto-arm: proven host rejection survives child death; cancellation remains silent with queue intact'
+}
+
+test_host_quota_crash_waits_and_signal_stays_silent
+
+test_quota_guard_allows_stop_without_touching_queue
+
+test_quota_wait_preserves_generation_and_resumes
+test_quota_wait_lost_owner_is_silent
 
 test_inert_in_child_worktree
 test_inert_without_session_lock

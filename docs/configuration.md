@@ -338,6 +338,20 @@ The primary-authoritative propagation contract, including removal of a mate's lo
 `config/supervision-host` is local to each home and not inherited, because each home's engine and model are its own choice.
 While the home runs the host, main's lease-checked commands also take the per-task lease lock, so a claim by the host's engine cannot race a mutation main already started (`bin/fm-lease-lib.sh`).
 
+### Optional Claude quota pause
+
+Create an empty `config/claude-quota-pause` to pause automatic Claude supervision on a recorded five-hour quota rejection until its explicit reset.
+The Stop hook uses its payload's transcript and the host uses its own engine conversation; `config/claude-quota-transcripts` optionally adds absolute transcript paths, one per line, for other sessions using the same account.
+Transcript records do not identify the account reliably, so these extra paths are an operator assertion and must not include other accounts.
+No credentials are read, no model is called to check usage, and no historical transcript tree is scanned.
+The parser reads at most the last 1 MiB of each of at most 32 files and requires `isApiErrorMessage: true`, `apiError: "usage_limit_reached"`, and a rejected `five_hour` record with an integer future `resetsAt` no more than five hours and five minutes ahead in `quotaLimits` or `apiErrorParams.rate_limit_info`.
+Warnings without a reset, prose-only messages, expired limits, and missing or unreadable evidence do not trigger a pause.
+Proven resets are retained in `state/.claude-quota-reset`, bound to the current primary session identity, so a stopped host cannot trigger a fresh model call through its parent.
+Pending notifications remain queued, and waiters check existing session and generation ownership every second.
+Remove the flag to stop waiting; the existing hook timeout still bounds the process, so a hook terminated before reset requires the next ordinary Stop or session restart to resume supervision.
+This opt-in affects newly invoked scripts; a hook or host already executing older code requires an ordinary lifecycle restart before it gains the protection.
+The implementation contract is in `bin/fm-claude-quota-lib.sh`; refresh its portable evidence with `bash tests/fm-claude-quota.test.sh` and the existing Stop-hook and supervision-host suites.
+
 ## Backlog backend (.tasks.toml / config/backlog-backend)
 
 The tracked `.tasks.toml` pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.

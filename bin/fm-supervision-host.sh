@@ -460,6 +460,20 @@ host_still_owner() {
     && [ "$FM_AUTOARM_OUTCOME" = arming ]
 }
 
+# Keep both engine turns and handbacks tokenless while a recorded account
+# rejection is active. Ownership loss exits through the existing cleanup.
+quota_wait() {
+  FM_CLAUDE_QUOTA_WAITED=0
+  [ -f "$CONFIG/claude-quota-pause" ] || return 0
+  # shellcheck source=bin/fm-claude-quota-lib.sh
+  . "$SCRIPT_DIR/fm-claude-quota-lib.sh"
+  if fm_claude_quota_reset; then
+    host_still_owner || exit 0
+    log_line "quota-pause\treset=$FM_CLAUDE_QUOTA_RESET\tscope=explicit-transcripts; account identity unavailable, same account assumed"
+  fi
+  fm_claude_quota_wait host_still_owner || exit 0
+}
+
 start_arm() {  # <predecessor-arm-pid or empty> [--restart]; sets the started pid/output
   local predecessor=$1 out pid
   shift
@@ -565,6 +579,7 @@ await_close() {
 # OUTPUT), so an owner reading a stream sees the whole exit at once.
 emit() {  # [line...]
   local text=$ARM_TEXT line
+  quota_wait
   for line in "$@"; do
     [ -n "$line" ] || continue
     text=${text:+$text$'\n'}$line
@@ -949,6 +964,13 @@ handle_wake() {  # <reason-lines>
     "$SCRIPT_DIR/fm-wake-grant.sh" release "$GEN" >/dev/null 2>&1 || true
     boundary_exit
   fi
+  quota_wait
+  if [ "${FM_CLAUDE_QUOTA_WAITED:-0}" = 1 ]; then
+    rm -f "$TURN_FILE"
+    "$SCRIPT_DIR/fm-wake-grant.sh" release "$GEN" >/dev/null 2>&1 || true
+    HANDLE_WHY="the recorded Claude quota window has reset; the pending wake remains yours"
+    return 1
+  fi
   result=$(mktemp "$STATE/.supervision-host-result.XXXXXX") || result=/dev/null
   errors=$(mktemp "$STATE/.supervision-host-errors.XXXXXX") || errors=/dev/null
   TURN_RESULT=$result
@@ -987,7 +1009,11 @@ handle_wake() {  # <reason-lines>
   if [ "$rc" -ne 0 ] || [ -z "$usage" ] || [ "${usage#error=0}" = "$usage" ]; then
     ENGINE_ERROR=1
   fi
-  health_record "$ENGINE_ERROR" "${receipts:-0}"
+  quota_wait
+  # A known exhausted window is not a broken engine and must not trip its latch.
+  if [ "${FM_CLAUDE_QUOTA_WAITED:-0}" != 1 ]; then
+    health_record "$ENGINE_ERROR" "${receipts:-0}"
+  fi
   if [ "$ENGINE_ERROR" -eq 0 ] && [ "${receipts:-0}" -gt 0 ] && [ -z "$unacked" ]; then
     write_engine_record $((ENGINE_TURNS + 1)) "$(printf '%s\n' "$usage" | sed -n 's/.* conversation_cost=\([^ ]*\).*/\1/p')" \
       || rm -f "$ENGINE_RECORD"
@@ -1089,6 +1115,7 @@ while :; do
     emit
     exit 0
   fi
+  quota_wait
   # Attended: the close reaches main exactly as the plain arm delivers it,
   # unless the supervision session may take it (attended_acceptor).
   if ! fm_afk_contract_away_present "$STATE"; then
